@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""Codex native notify callback and SMTP sender. Python 3.11+, standard library only."""
+import argparse
+import contextlib
+import datetime
+import email.utils
+from email.headerregistry import Address
+from email.message import EmailMessage
+import fcntl
+import getpass
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import smtplib
+import sqlite3
+import ssl
+import subprocess
+import sys
+import time
+import tomllib
+
+
+def config_path():
+    return Path(os.environ.get('CODEX24H_MAIL_CONFIG',
+        str(Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'codex24h/mail.toml'))).expanduser().resolve()
+
+
+def read_toml(path):
+    with Path(path).open('rb') as stream:
+        return tomllib.load(stream)
+
+
+def load_config(path, allow_disabled=False):
+    cfg = read_toml(path)
+    if not isinstance(cfg.get('enabled', False), bool):
+        raise ValueError('enabled must be true or false')
+    if not cfg.get('enabled', False) and not allow_disabled:
+        return None
+    for key in ('host', 'from'):
+        if not isinstance(cfg.get(key), str) or not cfg[key].strip():
+            raise ValueError(f'mail config requires {key}')
+    cfg['to'] = [cfg['to']] if isinstance(cfg.get('to'), str) else cfg.get('to')
+    if not cfg['to'] or not isinstance(cfg['to'], list):
+        raise ValueError('mail config requires a nonempty to address or array')
+    for address in [cfg['from'], *cfg['to']]:
+        parsed = Address(addr_spec=address)
+        if not parsed.domain or any(c in address for c in '\r\n'):
+            raise ValueError('invalid mail address')
+    cfg.setdefault('security', 'ssl')
+    if cfg['security'] not in ('ssl', 'starttls'):
+        raise ValueError('security must be ssl or starttls; TLS is required')
+    cfg.setdefault('port', 465 if cfg['security'] == 'ssl' else 587)
+    if not isinstance(cfg['port'], int) or not 1 <= cfg['port'] <= 65535:
+        raise ValueError('invalid SMTP port')
+    if cfg.get('password_file') and cfg.get('password_env'):
+        raise ValueError('choose password_file or password_env, not both')
+    if cfg.get('password_file'):
+        secret = Path(cfg['password_file']).expanduser()
+        if not secret.is_absolute():
+            secret = Path(path).parent / secret
+        cfg['password_file'] = str(secret)
+    if cfg.get('ca_file'):
+        ca = Path(cfg['ca_file']).expanduser()
+        cfg['ca_file'] = str(ca if ca.is_absolute() else Path(path).parent / ca)
+    return cfg
+
+
+def password(cfg):
+    if not cfg.get('username'):
+        return None
+    if cfg.get('password_file'):
+        path = Path(cfg['password_file'])
+        if path.stat().st_mode & 0o077:
+            raise ValueError('SMTP password file must be private: chmod 600')
+        value = path.read_text().rstrip('\r\n')
+    elif cfg.get('password_env'):
+        value = os.environ.get(cfg['password_env'], '')
+    else:
+        raise ValueError('SMTP username requires password_file or password_env')
+    if not value:
+        raise ValueError('SMTP password is empty or unavailable')
+    return value
+
+
+def state_dir(cfg):
+    path = Path(cfg.get('state_dir',
+        str(Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'codex24h/mail'))).expanduser()
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return path
+
+
+@contextlib.contextmanager
+def database(cfg):
+    conn = sqlite3.connect(state_dir(cfg) / 'deliveries.sqlite', timeout=5)
+    try:
+        conn.execute('''CREATE TABLE IF NOT EXISTS jobs (
+            key TEXT PRIMARY KEY, config TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0, error TEXT, sent_at INTEGER)''')
+        conn.execute('CREATE TABLE IF NOT EXISTS goals (key TEXT PRIMARY KEY, job_key TEXT NOT NULL)')
+        conn.commit()
+        yield conn
+    finally:
+        conn.close()
+
+
+def metadata(home, session):
+    """Read metadata only; never scan or interpret the conversation text."""
+    result = {'name': session, 'subagent': False, 'goal': None}
+    paths = sorted(Path(home).glob('state_*.sqlite'),
+                   key=lambda p: int(p.stem.split('_')[-1]) if p.stem.split('_')[-1].isdigit() else -1,
+                   reverse=True)
+    for path in paths:
+        try:
+            with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=.5)) as conn:
+                columns = {row[1] for row in conn.execute('PRAGMA table_info(threads)')}
+                name = 'name' if 'name' in columns else 'NULL'
+                row = conn.execute(f'SELECT {name}, title, source FROM threads WHERE id=?', (session,)).fetchone()
+                if row:
+                    result['name'] = row[0] or row[1] or session
+                    result['subagent'] = 'subagent' in (row[2] or '')
+                    break
+        except sqlite3.Error:
+            continue
+    path = Path(home) / 'goals_1.sqlite'
+    if path.exists():
+        try:
+            with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=.5)) as conn:
+                row = conn.execute('SELECT goal_id,status,updated_at_ms FROM thread_goals WHERE thread_id=?', (session,)).fetchone()
+                if row:
+                    result['goal'] = {'id': row[0], 'status': row[1], 'updated': row[2]}
+        except sqlite3.Error:
+            pass
+    result['name'] = ' '.join(str(result['name']).split())[:180] or session
+    return result
+
+
+def merge(base, patch):
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            merge(base[key], value)
+        else:
+            base[key] = value
+
+
+def previous_notify(home, args):
+    base_path = Path(home) / 'config.toml'
+    base = read_toml(base_path) if base_path.exists() else {}
+    overrides, profile = {}, None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == '--':
+            break
+        value = None
+        if arg in ('-c', '--config', '-p', '--profile'):
+            i += 1
+            if i >= len(args):
+                break  # Let Codex report its missing argument.
+            if arg in ('-p', '--profile'):
+                profile = args[i]
+            else:
+                value = args[i]
+        elif arg.startswith('--config='):
+            value = arg.split('=', 1)[1]
+        elif arg.startswith('-c') and len(arg) > 2:
+            value = arg[2:]
+        elif arg.startswith('--profile='):
+            profile = arg.split('=', 1)[1]
+        elif arg.startswith('-p') and len(arg) > 2:
+            profile = arg[2:]
+        if value is not None and '=' in value:
+            try:
+                merge(overrides, tomllib.loads(value))
+            except tomllib.TOMLDecodeError:
+                key, raw = value.split('=', 1)
+                if key.strip() == 'profile':
+                    overrides['profile'] = raw
+        i += 1
+    selected = profile or overrides.get('profile') or base.get('profile')
+    if selected:
+        merge(base, base.get('profiles', {}).get(selected, {}))
+        profile_file = Path(home) / f'{selected}.config.toml'
+        if profile_file.exists():
+            merge(base, read_toml(profile_file))
+    merge(base, overrides)
+    command = base.get('notify', [])
+    if not isinstance(command, list) or any(not isinstance(x, str) for x in command):
+        raise ValueError('existing Codex notify must be an array of strings')
+    if str(Path(__file__).resolve()) in command:
+        raise ValueError('remove the manual codex24h-mail notify override; the wrapper installs it per invocation')
+    return command
+
+
+def prepare(args):
+    cfg = load_config(args.config)
+    if cfg is None:
+        return
+    password(cfg)  # Fail before entering raw terminal mode if credentials are unavailable.
+    previous = previous_notify(args.codex_home, args.args)
+    command = [sys.executable, str(Path(__file__).resolve()), 'notify', '--config', str(Path(args.config).resolve()),
+               '--codex-home', str(Path(args.codex_home).resolve()), '--since', str(time.time_ns() // 1_000_000),
+               '--previous', json.dumps(previous)]
+    # JSON's string-array syntax is valid TOML for these paths and command arguments.
+    print('notify=' + json.dumps(command, ensure_ascii=False))
+
+
+def enqueue(cfg, config, home, since, event):
+    if event.get('type') != 'agent-turn-complete':
+        return None
+    session, turn = event.get('thread-id'), event.get('turn-id')
+    for value in (session, turn):
+        if not isinstance(value, str) or not value or len(value) > 200 or any(ord(c) < 32 for c in value):
+            raise ValueError('completion event requires valid thread-id and turn-id')
+    meta = metadata(home, session)
+    if meta['subagent']:
+        return None
+    scope = str(Path(config).resolve())
+    key = hashlib.sha256((scope + '\0' + session + '\0' + turn).encode()).hexdigest()
+    payload = {'session': session, 'turn': turn, 'name': meta['name'],
+               'completed_at': time.time_ns() // 1_000_000, 'goal_completed': False}
+    with database(cfg) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if conn.execute('SELECT 1 FROM jobs WHERE key=?', (key,)).fetchone():
+            return key
+        goal = meta['goal']
+        if goal and goal['status'] == 'complete' and goal['updated'] >= since:
+            goal_key = scope + '\0' + goal['id']
+            inserted = conn.execute('INSERT OR IGNORE INTO goals VALUES (?,?)', (goal_key, key)).rowcount
+            payload['goal_completed'] = bool(inserted)
+        conn.execute('INSERT INTO jobs(key,config,payload,state) VALUES (?,?,?,?)', (key, scope, json.dumps(payload, ensure_ascii=False), 'pending'))
+        conn.commit()
+    return key
+
+
+def mail_message(cfg, key, payload):
+    kind = 'Goal 已完成' if payload['goal_completed'] else '本轮已完成'
+    message = EmailMessage()
+    message['From'], message['To'] = cfg['from'], ', '.join(cfg['to'])
+    message['Subject'] = f'[Codex24h][{kind}] {payload["name"]}'
+    when = datetime.datetime.fromtimestamp(payload['completed_at'] / 1000, datetime.timezone.utc)
+    message['Date'] = email.utils.format_datetime(when)
+    message['Message-ID'] = f'<{key}@codex24h.local>'
+    message.set_content(f'{kind}\n\n会话：{payload["name"]}\nSession ID：{payload["session"]}\n'
+                        f'Turn ID：{payload["turn"]}\n完成时间：{when.isoformat()}\n\n'
+                        f'恢复会话：\ncodex24h resume {shlex.quote(payload["session"])}\n\n'
+                        '此邮件由 Codex 原生完成事件自动触发，未调用模型生成或发送。\n')
+    return message
+
+
+def deliver(cfg, message):
+    context = ssl.create_default_context(cafile=cfg.get('ca_file'))
+    secret = password(cfg)
+    if cfg['security'] == 'ssl':
+        client = smtplib.SMTP_SSL(cfg['host'], cfg['port'], timeout=15, context=context)
+    else:
+        client = smtplib.SMTP(cfg['host'], cfg['port'], timeout=15)
+    try:
+        if cfg['security'] == 'starttls':
+            client.ehlo()
+            client.starttls(context=context)
+            client.ehlo()
+        if cfg.get('username'):
+            client.login(cfg['username'], secret)
+        refused = client.send_message(message, from_addr=cfg['from'], to_addrs=cfg['to'])
+        if refused:
+            raise smtplib.SMTPRecipientsRefused(refused)
+    finally:
+        # Successful DATA acceptance counts as sent even if the server fails QUIT.
+        client.close()
+
+
+def worker(config, key):
+    cfg = load_config(config)
+    if cfg is None:
+        return
+    with (state_dir(cfg) / (key + '.lock')).open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        with database(cfg) as conn:
+            row = conn.execute('SELECT payload,state FROM jobs WHERE key=? AND config=?', (key, str(Path(config).resolve()))).fetchone()
+            if not row or row[1] == 'sent':
+                return
+            payload = json.loads(row[0])
+        for attempt in range(2):
+            with database(cfg) as conn:
+                conn.execute("UPDATE jobs SET state='sending',attempts=attempts+1,error=NULL WHERE key=?", (key,))
+                conn.commit()
+            try:
+                deliver(cfg, mail_message(cfg, key, payload))
+            except Exception as error:
+                # Do not persist server response bodies, passwords, or message content in errors.
+                label = type(error).__name__
+                if isinstance(error, smtplib.SMTPResponseException):
+                    label += f' ({error.smtp_code})'
+                with database(cfg) as conn:
+                    conn.execute("UPDATE jobs SET state='failed',error=? WHERE key=?", (label, key))
+                    conn.commit()
+                if isinstance(error, smtplib.SMTPResponseException):
+                    retry = 400 <= error.smtp_code < 500
+                else:
+                    retry = isinstance(error, smtplib.SMTPServerDisconnected) or (
+                        isinstance(error, OSError)
+                        and not isinstance(error, (smtplib.SMTPException, ssl.SSLCertVerificationError)))
+                if attempt == 0 and retry:
+                    time.sleep(2)
+                    continue
+                return
+            with database(cfg) as conn:
+                conn.execute("UPDATE jobs SET state='sent',error=NULL,sent_at=? WHERE key=?", (int(time.time()), key))
+                conn.commit()
+            return
+
+
+def spawn_worker(config, key):
+    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'worker', '--config', str(config), key],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True, close_fds=True)
+
+
+def notify(args):
+    previous = json.loads(args.previous)
+    if previous:
+        try:
+            subprocess.Popen([*previous, args.event], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+        except OSError as error:
+            print(f'codex24h-mail: previous notify failed: {type(error).__name__}', file=sys.stderr)
+    cfg = load_config(args.config)
+    if cfg:
+        key = enqueue(cfg, args.config, args.codex_home, args.since, json.loads(args.event))
+        if key:
+            spawn_worker(args.config, key)
+
+
+def main():
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(description=__doc__)
+    subs = parser.add_subparsers(dest='command', required=True)
+    for name in ('prepare', 'notify', 'worker', 'test', 'status', 'retry', 'set-password'):
+        sub = subs.add_parser(name)
+        sub.add_argument('--config', type=Path, default=config_path())
+        if name in ('prepare', 'notify'):
+            sub.add_argument('--codex-home', type=Path, default=Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')))
+        if name == 'prepare':
+            sub.add_argument('args', nargs=argparse.REMAINDER)
+        if name == 'notify':
+            sub.add_argument('--since', type=int, required=True)
+            sub.add_argument('--previous', default='[]')
+            sub.add_argument('event')
+        if name == 'worker':
+            sub.add_argument('key')
+    args = parser.parse_args()
+    if args.command == 'prepare':
+        if args.args[:1] == ['--']:
+            args.args.pop(0)
+        prepare(args)
+    elif args.command == 'notify':
+        notify(args)
+    elif args.command == 'worker':
+        worker(args.config, args.key)
+    else:
+        cfg = load_config(args.config, allow_disabled=args.command in ('test', 'set-password'))
+        if cfg is None:
+            print('Email notifications are disabled.')
+            return
+        if args.command == 'set-password':
+            if not cfg.get('password_file'):
+                raise ValueError('set password_file in the mail config first')
+            secret = getpass.getpass('SMTP authorization code (hidden): ')
+            if not secret:
+                raise ValueError('authorization code must not be empty')
+            path = Path(cfg['password_file'])
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                os.write(fd, secret.encode())
+            finally:
+                os.close(fd)
+            print('SMTP credential saved privately.')
+        elif args.command == 'test':
+            payload = {'name': '邮件配置测试', 'session': 'test', 'turn': 'test',
+                       'completed_at': time.time_ns() // 1_000_000, 'goal_completed': False}
+            message = mail_message(cfg, hashlib.sha256(os.urandom(32)).hexdigest(), payload)
+            message.replace_header('Subject', '[Codex24h] 邮件配置测试')
+            message.set_content('这是一封 Codex24h SMTP 测试邮件。\n收到此邮件说明发信配置可用；本次测试没有启动模型任务。\n')
+            deliver(cfg, message)
+            print('Test email accepted by SMTP server.')
+        else:
+            with database(cfg) as conn:
+                if args.command == 'status':
+                    for key, state, attempts, error in conn.execute('SELECT key,state,attempts,error FROM jobs WHERE config=? ORDER BY rowid DESC LIMIT 20', (str(args.config.resolve()),)):
+                        print(f'{key[:12]}  {state:8}  attempts={attempts}  {error or ""}')
+                else:
+                    keys = [row[0] for row in conn.execute("SELECT key FROM jobs WHERE state != 'sent' AND config=?", (str(args.config.resolve()),))]
+                    for key in keys:
+                        worker(args.config, key)
+                    print(f'Processed {len(keys)} queued deliveries; run status for results.')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        # Detailed configuration errors are safe; raw SMTP replies may not be.
+        text = str(error) if isinstance(error, (ValueError, FileNotFoundError, PermissionError)) else type(error).__name__
+        print(f'codex24h-mail: {text}', file=sys.stderr)
+        sys.exit(1)

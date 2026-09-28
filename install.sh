@@ -9,5 +9,6 @@ temporary_binary="$bin_dir/.codex24h-install-$$"
 trap 'rm -f -- "$temporary_binary"' EXIT
 install -m 755 target/release/codex24h "$temporary_binary"
 mv -f -- "$temporary_binary" "$bin_dir/codex24h"
+install -m 755 scripts/codex24h-mail "$bin_dir/codex24h-mail"
 printf 'Installed %s/codex24h\n' "$bin_dir"
 printf 'Run: codex24h [the same arguments you pass to codex]\n'

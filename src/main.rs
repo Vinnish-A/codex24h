@@ -52,7 +52,7 @@ fn pty_size(size: Size) -> PtySize {
     }
 }
 fn run() -> Result<i32> {
-    let args: Vec<_> = env::args_os().skip(1).collect();
+    let args = codex24h::mail::arguments(env::args_os().skip(1).collect())?;
     let exe = launch::resolve_codex()?;
     if !terminal::is_tty(0) || !terminal::is_tty(1) || !launch::interactive(&args) {
         return Err(Command::new(exe).args(args).exec().into());

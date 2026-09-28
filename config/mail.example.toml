@@ -1,0 +1,10 @@
+# Copy to ~/.config/codex24h/mail.toml and fill in your mail service settings.
+enabled = false
+host = "smtp.example.com"
+port = 465
+security = "ssl"                 # ssl (usually 465) or starttls (usually 587)
+from = "sender@example.com"
+to = ["recipient@example.com"]
+username = "sender@example.com"
+password_file = "smtp-password"  # Relative to this config; chmod 600 this file.
+# password_env = "CODEX24H_SMTP_PASSWORD"  # Alternative; must exist in Codex's environment.

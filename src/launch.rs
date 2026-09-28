@@ -60,15 +60,30 @@ fn usable_path(path: &Path, current: &Path) -> Option<PathBuf> {
 /// Whether these Codex arguments would enter its interactive TUI. This parser
 /// only needs to identify the root command; Codex itself remains responsible
 /// for validating every argument.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Invocation {
+    Interactive,
+    Batch,
+    Other,
+}
+
 pub fn interactive(args: &[OsString]) -> bool {
+    invocation(args) == Invocation::Interactive
+}
+
+pub fn notifying(args: &[OsString]) -> bool {
+    invocation(args) != Invocation::Other
+}
+
+fn invocation(args: &[OsString]) -> Invocation {
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
         if arg == "--" {
-            return true; // Everything afterward is the root prompt.
+            return Invocation::Interactive; // Everything afterward is the root prompt.
         }
         if arg == "--help" || arg == "-h" || arg == "--version" || arg == "-V" {
-            return false;
+            return Invocation::Other;
         }
         if arg == "--no-alt-screen" {
             index += 1;
@@ -95,14 +110,26 @@ pub fn interactive(args: &[OsString]) -> bool {
         if arg.to_string_lossy().starts_with('-') {
             // Unknown future options are passed through unchanged. Avoid
             // guessing whether their following argument is a command.
-            return false;
+            return Invocation::Other;
         }
         if arg == "resume" || arg == "fork" {
-            return !requests_help(&args[index + 1..]);
+            return if requests_help(&args[index + 1..]) {
+                Invocation::Other
+            } else {
+                Invocation::Interactive
+            };
         }
-        return !is_command(arg) && !requests_help(&args[index + 1..]);
+        return if requests_help(&args[index + 1..]) {
+            Invocation::Other
+        } else if matches!(arg.to_str(), Some("exec" | "e" | "review")) {
+            Invocation::Batch
+        } else if is_command(arg) {
+            Invocation::Other
+        } else {
+            Invocation::Interactive
+        };
     }
-    true
+    Invocation::Interactive
 }
 
 fn requests_help(args: &[OsString]) -> bool {
