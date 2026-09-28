@@ -63,6 +63,8 @@ pub struct Router {
     pass_next: bool,
     reply_wait: Option<Instant>,
     deferred: VecDeque<Action>,
+    detachable: bool,
+    detach_requested: bool,
 }
 
 impl Default for Router {
@@ -83,6 +85,8 @@ impl Router {
             pass_next: false,
             reply_wait: None,
             deferred: VecDeque::new(),
+            detachable: false,
+            detach_requested: false,
         }
     }
 
@@ -90,6 +94,14 @@ impl Router {
         self.mode = mode;
         self.prefix = None;
         self.pass_next = false;
+    }
+
+    pub fn set_detachable(&mut self, enabled: bool) {
+        self.detachable = enabled;
+    }
+
+    pub fn detach_requested(&self) -> bool {
+        self.detach_requested
     }
 
     pub fn has_pending(&self) -> bool {
@@ -245,6 +257,7 @@ impl Router {
                     continue;
                 }
                 match command_char(&token) {
+                    Some('d') if self.detachable => self.detach_requested = true,
                     Some('b') => out.push(Action::Bottom),
                     Some('/') => out.push(Action::Search),
                     Some('[') => out.push(Action::CopyMode),
@@ -576,7 +589,7 @@ fn command_char(token: &[u8]) -> Option<char> {
     } else {
         char::from_u32(key.code)
     };
-    if primary.is_some_and(|ch| matches!(ch, 'b' | '/' | '[' | '?' | 'p')) {
+    if primary.is_some_and(|ch| matches!(ch, 'b' | 'd' | '/' | '[' | '?' | 'p')) {
         return primary;
     }
     key.base
@@ -696,6 +709,22 @@ fn local_action(token: &[u8]) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detach_is_attach_only_and_never_triggered_by_paste() {
+        let mut router = Router::new();
+        assert_eq!(
+            router.feed(b"\x1dd"),
+            vec![Action::Forward(b"\x1dd".to_vec())]
+        );
+        router.set_detachable(true);
+        let paste = b"\x1b[200~\x1dd\x1b[201~";
+        assert_eq!(router.feed(paste), vec![Action::Forward(paste.to_vec())]);
+        assert!(!router.detach_requested());
+        router.set_mode(InputMode::Local);
+        assert!(router.feed(b"\x1b[93;5u\x1b[100u").is_empty());
+        assert!(router.detach_requested());
+    }
 
     #[test]
     fn ordinary_input_and_unknown_sequences_are_exact() {

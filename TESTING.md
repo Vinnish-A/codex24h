@@ -37,3 +37,15 @@ python3 tests/native_tmux.py SESSION_ID --cwd /path/to/project
 - 换用有效客户端授权码后，网易 SMTP 认证及测试邮件投递通过，服务器已接受邮件；本机自动通知已启用。收件箱是否实际收到尚未人工确认。
 
 复现方式和配置见[邮件通知](docs/mail.md)。
+
+## 实验性 tmux 接入
+
+同日本机 Codex 0.158.0、tmux 3.2a、WSL2：
+
+- `reptyr` 普通模式及 `-T` 在独立测试 PTY 上均返回 `Operation not permitted`；系统 `ptrace_scope=1` 未修改，失败未结束目标进程。因此未加入普通终端进程迁移。
+- 新增 `codex24h attach <PID>`，仅连接已有 tmux 单窗格窗口。43 项 Rust 测试通过；已安装 release 的 4 项 attach 集成测试和 10 项原有 PTY 回归通过。
+- attach 集成覆盖滚轮冻结、后台输出、原生风格选项、尺寸变化、断开再接入保持 PID、外部终止信号只断开客户端、源会话被删除后保留任务，以及拒绝普通 PTY 时不影响目标。
+- 原版 Codex 实测：先提交 `sleep 12` 与算术回答任务，执行中接入；接入后完成，PID 和启动时间保持一致。随后历史输入召回、Tab 补全、模型菜单及断开后原 tmux 终端继续输入均通过。
+- 测试使用独立本机 tmux server 和现有 Codex 登录，未接管用户正在工作的窗格。未修改全局 tmux、termInfo 或系统权限配置。原生任务测试关闭了测试会话的邮件通知。
+
+接入前历史导入、普通终端迁移、多窗格布局、实体手机操作仍不在支持范围内。命令与边界见[接入说明](docs/attach.md)。

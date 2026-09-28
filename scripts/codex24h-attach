@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Attach an existing tmux terminal without migrating or restarting its process."""
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+
+
+def tmux(socket, *args):
+    result = subprocess.run(['tmux', '-S', socket, *args], capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or 'tmux command failed')
+    return result.stdout.strip()
+
+
+def panes(socket):
+    # Fixed fields only; no titles, shell text or Codex transcript parsing.
+    fields = '#{pane_pid}\t#{pane_id}\t#{pane_tty}\t#{session_id}\t#{window_id}\t#{window_panes}\t#{pane_in_mode}\t#{pane_current_command}'
+    return [row.split('\t') for row in tmux(socket, 'list-panes', '-a', '-F', fields).splitlines()]
+
+
+def main():
+    client = os.environ.get('CODEX24H_TMUX_CLIENT')
+    if client:
+        socket, session, pane, terminfo = json.loads(client)
+        env = dict(os.environ, TERM='codex24h-attach', TERMINFO=terminfo)
+        env.pop('TMUX', None)
+        env.pop('CODEX24H_TMUX_CLIENT', None)
+        os.execvpe('tmux', ['tmux', '-S', socket, 'attach-session', '-E', '-f', 'active-pane',
+                           '-t', session, ';', 'select-pane', '-t', pane], env)
+
+    parser = argparse.ArgumentParser(prog='codex24h attach', description=(
+        '实验性：连接已有 tmux 单窗格窗口中的进程，不重启 Codex。Ctrl+] 然后 d 断开。'))
+    parser.add_argument('pid', type=int, nargs='?', help='目标进程 PID（同一窗格的 shell PID 也可）')
+    parser.add_argument('--list', action='store_true', help='列出 tmux 窗格及其起始进程 PID')
+    parser.add_argument('--socket', help='tmux socket 路径；默认当前 TMUX 或默认 server')
+    parser.add_argument('--wrapper', required=True, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if not args.list and (args.pid is None or args.pid <= 0):
+        parser.error('请指定正整数 PID，或使用 --list')
+    if not shutil.which('tmux'):
+        raise RuntimeError('attach 需要 tmux；目前不支持直接迁移普通终端中的进程。')
+    socket = args.socket
+    if not socket:
+        if os.environ.get('TMUX'):
+            socket = os.environ['TMUX'].rsplit(',', 2)[0]
+        else:
+            result = subprocess.run(['tmux', 'display-message', '-p', '#{socket_path}'],
+                                    capture_output=True, text=True)
+            if result.returncode:
+                raise RuntimeError('没有可连接的 tmux server。直接启动的 Codex 暂不能安全接管；不会重启目标进程。')
+            socket = result.stdout.strip()
+    available = panes(socket)
+    if args.list:
+        print('PANE_PID\tPANE\tCOMMAND')
+        for pid, pane, _, _, _, _, _, command in available:
+            print(f'{pid}\t{pane}\t{command}')
+        return 0
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise RuntimeError('attach 需要交互终端。请在另一个终端中运行此命令。')
+    process = Path(f'/proc/{args.pid}')
+    if process.stat().st_uid != os.getuid():
+        raise RuntimeError('只能连接当前用户的进程。')
+    tty = os.readlink(process/'fd/0')
+    candidates = [row for row in available if row[2] == tty]
+    if not candidates:
+        raise RuntimeError('目标不在此 tmux server 中。可用 --socket 指定其他 server；普通终端进程暂不支持安全接管。')
+    _, pane, tty, source, window, count, in_mode, command = candidates[0]
+    if tty == os.ttyname(0):
+        raise RuntimeError('不能从目标自身的终端接入。请在另一个终端或窗格执行 attach。')
+    if count != '1':
+        raise RuntimeError('实验版仅支持单窗格窗口，避免修改已有分屏布局。')
+    if in_mode != '0':
+        raise RuntimeError('目标 tmux 窗格正在复制/选择模式；请先退出该模式再连接。')
+    if command == 'codex24h':
+        raise RuntimeError('目标窗格已经运行 codex24h，无需再次包裹。')
+    if not shutil.which('tic'):
+        raise RuntimeError('attach 需要 tic（通常由 ncurses-bin 提供），用于独立终端能力配置。')
+
+    # tmux normally uses the alternate screen, which has no scrollback. A private
+    # terminfo entry keeps this client on the primary screen, without modifying
+    # the user's tmux server options or Codex's existing terminal environment.
+    with tempfile.TemporaryDirectory(prefix='codex24h-attach-') as directory:
+        source_file = Path(directory)/'terminal.src'
+        source_file.write_text('codex24h-attach|Codex24h attach terminal,\n smcup@, rmcup@, use=xterm-256color,\n')
+        terminfo = str(Path(directory)/'terminfo')
+        result = subprocess.run(['tic', '-x', '-o', terminfo, str(source_file)], capture_output=True, text=True)
+        if result.returncode:
+            raise RuntimeError('无法生成 attach terminfo: '+result.stderr.strip())
+        # Grouped sessions share existing windows, but selection and session
+        # options are independent. No shell or Codex process is started here.
+        session = tmux(socket, 'new-session', '-d', '-P', '-F', '#{session_id}',
+                       '-s', f'codex24h-attach-{os.getpid()}', '-t', source)
+        child = None
+        try:
+            tmux(socket, 'set-option', '-t', session, 'status', 'off', ';',
+                 'set-option', '-t', session, 'prefix', 'None', ';',
+                 'set-option', '-t', session, 'prefix2', 'None', ';',
+                 'set-option', '-t', session, 'destroy-unattached', 'off', ';',
+                 'select-window', '-t', f'{session}:{window}')
+            env = dict(os.environ, CODEX24H_CODEX=str(Path(__file__).resolve()), CODEX24H_MAIL='0',
+                       CODEX24H_TMUX_CLIENT=json.dumps([socket, session, pane, terminfo]))
+            child = subprocess.Popen([args.wrapper], env=env)
+
+            def forward(signum, _frame):
+                if child.poll() is None:
+                    child.send_signal(signum)
+
+            for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+                signal.signal(signum, forward)
+            returncode = child.wait()
+            return returncode if returncode >= 0 else 128-returncode
+        finally:
+            if child and child.poll() is None:
+                child.terminate()
+                child.wait(timeout=5)
+            # If the original session was removed while attached, keep our
+            # session: deleting its last window reference would kill the task.
+            existing = subprocess.run(['tmux', '-S', socket, 'has-session', '-t', source],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if existing.returncode == 0:
+                subprocess.run(['tmux', '-S', socket, 'kill-session', '-t', session],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                print(f'原 tmux 会话已关闭；保留连接会话 {session}，以免结束任务。', file=sys.stderr)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        print(f'codex24h attach: {exc}', file=sys.stderr)
+        sys.exit(1)

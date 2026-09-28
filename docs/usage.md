@@ -22,7 +22,7 @@ codex24h exec --json "your prompt"
 
 安装位置默认 `~/.local/bin/codex24h`，入口统一为 `codex24h`。可用 `CODEX24H_BIN_DIR` 选择安装目录。原来的 `codex` 命令保持不变。
 
-`codex24h --help` 显示原版 Codex 帮助。Wrapper 的帮助在界面中按 **Ctrl+]，然后 ?**。所有原始参数按字节保留；交互入口增加 `--no-alt-screen`，由 wrapper 管理外层屏幕和历史。非交互命令、帮助和非 TTY 输入/输出直接执行原版 Codex，保留 stdout、stderr 和退出码。
+`codex24h --help` 显示原版 Codex 帮助。Wrapper 的帮助在界面中按 **Ctrl+]，然后 ?**。除实验性的 [`attach`](attach.md) 子命令外，所有原始参数按字节保留；交互入口增加 `--no-alt-screen`，由 wrapper 管理外层屏幕和历史。非交互命令、帮助和非 TTY 输入/输出直接执行原版 Codex，保留 stdout、stderr 和退出码。若提示词本身是 `attach`，可用 `codex24h -- attach`。
 
 ## 滚动与输入
 

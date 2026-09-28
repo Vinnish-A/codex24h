@@ -52,7 +52,23 @@ fn pty_size(size: Size) -> PtySize {
     }
 }
 fn run() -> Result<i32> {
-    let args = codex24h::mail::arguments(env::args_os().skip(1).collect())?;
+    let args: Vec<_> = env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "attach") {
+        let binary = env::current_exe()?;
+        let mut helper = binary.with_file_name("codex24h-attach");
+        if !helper.is_file() {
+            helper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/codex24h-attach");
+        }
+        return Err(Command::new("python3")
+            .arg(helper)
+            .arg("--wrapper")
+            .arg(binary)
+            .args(&args[1..])
+            .exec()
+            .into());
+    }
+    let attached = env::var_os("CODEX24H_TMUX_CLIENT").is_some();
+    let args = codex24h::mail::arguments(args)?;
     let exe = launch::resolve_codex()?;
     if !terminal::is_tty(0) || !terminal::is_tty(1) || !launch::interactive(&args) {
         return Err(Command::new(exe).args(args).exec().into());
@@ -96,6 +112,7 @@ fn run() -> Result<i32> {
             export_dir,
         );
         let mut router = Router::new();
+        router.set_detachable(attached);
         let mut renderer = Renderer::new();
         let mut router_mode = core.input_mode();
         let mut child_write = Vec::new();
@@ -140,6 +157,9 @@ fn run() -> Result<i32> {
         );
         let mut buf = [0u8; 65536];
         loop {
+            if router.detach_requested() {
+                return Ok(0);
+            }
             let signal = terminate.load(Ordering::Relaxed);
             if signal != 0 {
                 return Ok(128 + signal as i32);
@@ -207,6 +227,10 @@ fn run() -> Result<i32> {
                         || now.duration_since(last_draw) >= Duration::from_millis(250))
                 {
                     let mut frame = core.frame();
+                    if attached && core.mode == Mode::Follow {
+                        frame.status =
+                            "codex24h attached · wheel: history · Ctrl+] d: detach".into();
+                    }
                     if let Some(code) = exit_code {
                         frame.status = format!(
                             "Codex exited ({code}) · q / Enter: close · Ctrl+] b: final screen"
@@ -285,7 +309,7 @@ fn run() -> Result<i32> {
                             exit_code,
                         ) {
                             final_screen = Some(core.exit_text());
-                            return Ok(exit_code.unwrap());
+                            return Ok(exit_code.unwrap_or(0));
                         }
                     }
                     Err(e) if transient(&e) => {}
@@ -389,7 +413,7 @@ fn route(
         }
         actions = router.drain_step();
     }
-    false
+    router.detach_requested()
 }
 fn child_exit_code(status: &portable_pty::ExitStatus) -> i32 {
     if let Some(name) = status.signal() {

@@ -199,7 +199,7 @@ class WrapperE2E(unittest.TestCase):
         self.env = os.environ.copy()
         self.env.update(
             CODEX24H_CODEX=str(FAKE), FAKE_LOG_DIR=self.temp.name,
-            CODEX24H_HISTORY="40", TERM="xterm-256color",
+            CODEX24H_HISTORY="40", CODEX24H_MAIL="0", TERM="xterm-256color",
         )
 
     def log(self, name):
