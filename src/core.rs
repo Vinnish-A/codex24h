@@ -171,10 +171,12 @@ pub struct Core {
     title: Option<String>,
     bell: bool,
     last_live: Vec<Cell>,
+    pub pin_rows: usize,
     pub unread: u64,
     pub dirty: bool,
     pub query: String,
     note: String,
+    mouse_press: Option<(u16, u16, Frame)>,
     history_limit: usize,
     foreground: Rgb,
     background: Rgb,
@@ -220,10 +222,12 @@ impl Core {
             title: None,
             bell: false,
             last_live: vec![],
+            pin_rows: 0,
             unread: 0,
             dirty: true,
             query: String::new(),
             note: String::new(),
+            mouse_press: None,
             history_limit: history,
             foreground,
             background,
@@ -340,26 +344,76 @@ impl Core {
         self.term.resize(size);
         self.size = size;
         self.dirty = true;
-        // Keep frozen cell content across a physical resize; do not read live output.
-        if let Some(old) = self.frozen.take() {
-            let mut cells = vec![Cell::default(); size.rows * size.cols];
-            for r in 0..old.rows.min(size.rows) {
-                for c in 0..old.cols.min(size.cols) {
-                    cells[r * size.cols + c] = old.cells[r * old.cols + c].clone();
-                }
-            }
-            self.frozen = Some(Frame {
-                rows: size.rows,
-                cols: size.cols,
-                cells,
-                cursor: None,
-                cursor_shape: 0,
-                status: String::new(),
-                selection: None,
-            });
-        }
+        // Keep the original frozen frame intact. Cropping belongs to display,
+        // otherwise a phone rotation permanently erases its off-screen cells.
         if let Some(doc) = &mut self.document {
             doc.top = doc.top.min(doc.rows.len().saturating_sub(size.rows));
+        }
+    }
+    // Infer terminal focus from the visible caret or a reverse-video selection.
+    // Blank rows bound the active block; no Codex labels or business text are read.
+    fn pin_band(&self) -> Option<(usize, usize, usize)> {
+        if self.mode != Mode::Browse || self.pin_rows == 0 || self.size.rows < 5 {
+            return None;
+        }
+        let mut blank = vec![true; self.size.rows];
+        let mut inverse = vec![false; self.size.rows];
+        for row in 0..self.size.rows {
+            for col in 0..self.size.cols {
+                let cell = &self.term.grid()[Line(row as i32)][Column(col)];
+                if cell.c != ' ' || cell.zerowidth().is_some() {
+                    blank[row] = false;
+                    inverse[row] |= cell.flags.contains(Flags::INVERSE);
+                }
+            }
+        }
+        let caret = (self.term.grid().cursor.point.line.0.max(0) as usize).min(self.size.rows - 1);
+        let (focus_start, focus_end, gap) = if self.term.mode().contains(TermMode::SHOW_CURSOR) {
+            (caret, caret, 1)
+        } else if let Some(end) = inverse.iter().rposition(|selected| *selected) {
+            let mut start = end;
+            while start > 0 && inverse[start - 1] {
+                start -= 1;
+            }
+            // A menu can contain single blank rows between its heading, options
+            // and help. Two blank rows separate it from the transcript.
+            (start, end, 2)
+        } else {
+            let last = blank.iter().rposition(|empty| !empty).unwrap_or(caret);
+            (last, last, 1)
+        };
+        let mut start = 0;
+        let mut end = self.size.rows;
+        let mut empty = 0;
+        for row in (0..focus_start).rev() {
+            empty = if blank[row] { empty + 1 } else { 0 };
+            if empty == gap {
+                start = row + gap;
+                break;
+            }
+        }
+        empty = 0;
+        for (row, is_blank) in blank.iter().enumerate().skip(focus_end + 1) {
+            empty = if *is_blank { empty + 1 } else { 0 };
+            if empty == gap {
+                end = row + 1 - gap;
+                break;
+            }
+        }
+        let height = self.pin_rows.min(self.size.rows - 3).min(end - start);
+        let focus_height = (focus_end - focus_start + 1).min(height);
+        let source = focus_start
+            .saturating_sub((height - focus_height) / 2)
+            .clamp(start, end - height);
+        Some((source, self.size.rows - height, height))
+    }
+    fn browse_rows(&self) -> usize {
+        if let Some((_, dest, _)) = self.pin_band() {
+            dest - 1
+        } else if self.pin_rows > 0 && self.size.rows >= 5 {
+            self.size.rows - self.pin_rows.min(self.size.rows - 3) - 1
+        } else {
+            self.size.rows
         }
     }
     fn resolved(&self, mut cell: Cell) -> Cell {
@@ -477,6 +531,9 @@ impl Core {
     }
     pub fn action(&mut self, action: Action) {
         self.dirty = true;
+        if !matches!(&action, Action::Mouse { .. }) {
+            self.mouse_press = None;
+        }
         match action {
             Action::Forward(bytes) => self.pty_out.extend(bytes),
             Action::TerminalReply(bytes) => {
@@ -494,9 +551,13 @@ impl Core {
                 }
             }
             Action::Scroll(delta) => self.scroll(delta),
-            Action::PageUp => self.scroll(self.size.rows.saturating_sub(1).max(1) as i32),
-            Action::PageDown => self.scroll(-(self.size.rows.saturating_sub(1).max(1) as i32)),
+            Action::PageUp => self.scroll(self.browse_rows().saturating_sub(1).max(1) as i32),
+            Action::PageDown => self.scroll(-(self.browse_rows().saturating_sub(1).max(1) as i32)),
             Action::Bottom => self.bottom(),
+            Action::PinToggle => self.pin_rows = if self.pin_rows == 0 { 6 } else { 0 },
+            Action::PinResize(delta) => {
+                self.pin_rows = (self.pin_rows as i32 + delta).clamp(0, 100) as usize
+            }
             Action::CopyMode => {
                 self.document();
                 self.mode = Mode::Copy;
@@ -519,16 +580,67 @@ impl Core {
             Action::Mouse {
                 button,
                 col,
-                row,
+                mut row,
                 release,
             } => {
                 if row as usize > self.size.rows {
-                    if !release && button & 3 == 0 {
-                        self.bottom();
+                    if button & 3 == 0 && (self.mode == Mode::Copy || self.mouse_press.is_some()) {
+                        row = self.size.rows as u16;
+                    } else {
+                        if !release && button & 35 == 0 {
+                            self.bottom();
+                        }
+                        return;
                     }
-                    return;
                 }
-                if self.mode == Mode::Follow && self.term.mode().intersects(TermMode::MOUSE_MODE) {
+                // A click must not steal composer keys. Start copy mode only
+                // after a left-button drag, using the screen seen on mouse-down.
+                let band = self.pin_band();
+                let live_band = band.is_some_and(|(_, dest, _)| row as usize > dest);
+                let application_mouse = (self.mode == Mode::Follow || live_band)
+                    && self.term.mode().intersects(TermMode::MOUSE_MODE);
+                if !application_mouse
+                    && button & 3 == 0
+                    && matches!(self.mode, Mode::Follow | Mode::Browse)
+                {
+                    if !release && button & 32 == 0 {
+                        self.mouse_press = Some((col, row, self.frame()));
+                        return;
+                    }
+                    if let Some((start_col, start_row, frame)) = self.mouse_press.take() {
+                        if (col, row) == (start_col, start_row) {
+                            if !release {
+                                self.mouse_press = Some((start_col, start_row, frame));
+                            }
+                            return;
+                        }
+                        self.document();
+                        let doc = self.document.as_mut().unwrap();
+                        for r in 0..frame.rows {
+                            if doc.top + r < doc.rows.len() {
+                                let cells =
+                                    frame.cells[r * frame.cols..(r + 1) * frame.cols].to_vec();
+                                doc.wrapped[doc.top + r] = cells
+                                    .last()
+                                    .is_some_and(|c| c.flags.contains(Flags::WRAPLINE));
+                                doc.rows[doc.top + r] = cells;
+                            }
+                        }
+                        doc.anchor = Some((
+                            doc.top + start_row.saturating_sub(1) as usize,
+                            (start_col.saturating_sub(1) as usize).min(doc.cols - 1),
+                        ));
+                        self.mode = Mode::Copy;
+                        self.note.clear();
+                    }
+                }
+                if application_mouse {
+                    self.mouse_press = None;
+                    if let Some((source, dest, _)) = band {
+                        row = (source + row as usize - dest) as u16;
+                    }
+                }
+                if application_mouse {
                     if button & 32 != 0
                         && !self.term.mode().contains(TermMode::MOUSE_MOTION)
                         && (button & 3 == 3 || !self.term.mode().contains(TermMode::MOUSE_DRAG))
@@ -565,6 +677,14 @@ impl Core {
                         doc.anchor = Some(point);
                     }
                     doc.cursor = point;
+                    if release && doc.anchor.is_some() {
+                        let text = doc.text(true);
+                        self.clipboard(&text);
+                        self.note = format!(
+                            "Copied {} bytes via OSC52 · Esc: browse · e: export",
+                            text.len()
+                        );
+                    }
                 }
             }
         }
@@ -797,12 +917,43 @@ impl Core {
                 selection: None,
             }
         } else if self.mode != Mode::Follow {
-            self.frozen.clone().unwrap_or_else(|| self.live_frame())
+            let mut frame = self.frozen.clone().unwrap_or_else(|| self.live_frame());
+            if frame.rows != self.size.rows || frame.cols != self.size.cols {
+                let mut cells = vec![Cell::default(); self.size.rows * self.size.cols];
+                for r in 0..frame.rows.min(self.size.rows) {
+                    for c in 0..frame.cols.min(self.size.cols) {
+                        cells[r * self.size.cols + c] = frame.cells[r * frame.cols + c].clone();
+                    }
+                }
+                frame.rows = self.size.rows;
+                frame.cols = self.size.cols;
+                frame.cells = cells;
+            }
+            frame
         } else {
             self.live_frame()
         };
         if matches!(self.mode, Mode::Browse | Mode::Help) {
             frame.cursor = None;
+        }
+        if let Some((source, dest, height)) = self.pin_band() {
+            let live = self.live_frame();
+            let cols = self.size.cols;
+            frame.cells[dest * cols..(dest + height) * cols]
+                .clone_from_slice(&live.cells[source * cols..(source + height) * cols]);
+            frame.cells[(dest - 1) * cols..dest * cols].fill(Cell::default());
+            for (col, ch) in "-- live input | Ctrl+] i toggle; +/- height --"
+                .chars()
+                .take(cols)
+                .enumerate()
+            {
+                frame.cells[(dest - 1) * cols + col].c = ch;
+            }
+            frame.cursor = live.cursor.and_then(|(row, col)| {
+                (row >= source && row < source + height)
+                    .then_some((dest + row.saturating_sub(source), col))
+            });
+            frame.cursor_shape = live.cursor_shape;
         }
         frame.status = match self.mode {
             Mode::Follow => "codex24h · PgUp / wheel: history · Ctrl+] ?: help".into(),
@@ -839,6 +990,7 @@ impl Core {
                 "",
                 "Wheel / PageUp / PageDown   browse terminal history",
                 "Ctrl+] then b              return to latest",
+                "Ctrl+] then i / + / -      toggle / grow / shrink live input",
                 "Ctrl+] then /              search history (literal, case sensitive)",
                 "Ctrl+] then [              copy mode",
                 "Ctrl+] then p              pass next key unchanged",
@@ -950,6 +1102,99 @@ mod tests {
         c.frame().cells.iter().map(|c| c.c).collect()
     }
     #[test]
+    fn pinned_input_updates_without_moving_history_or_stealing_keys() {
+        let mut c = core(100);
+        c.pin_rows = 3;
+        for i in 0..20 {
+            c.process(format!("history-{i}\r\n").as_bytes());
+        }
+        c.process(b"\x1b[5;1Hdraft\x1b[?25h");
+        c.action(Action::Scroll(4));
+        let frozen = c.frame().cells[..2 * c.size.cols].to_vec();
+        c.process(b"\x1b[1;1Hnew output\x1b[5;1Hupdated");
+        let frame = c.frame();
+        assert_eq!(frame.cells[..2 * c.size.cols], frozen);
+        assert!(
+            frame.cells[3 * c.size.cols..]
+                .iter()
+                .map(|v| v.c)
+                .collect::<String>()
+                .contains("updated")
+        );
+        assert!(frame.cursor.is_some());
+        c.action(Action::Forward(b"\t\x1b[A".to_vec()));
+        assert!(c.pty_out.ends_with(b"\t\x1b[A"));
+        assert_eq!(c.mode, Mode::Browse);
+        c.action(Action::PinToggle);
+        assert!(c.frame().cursor.is_none());
+        c.action(Action::Search);
+        assert!(c.pin_band().is_none());
+    }
+
+    #[test]
+    fn hidden_caret_menu_follows_reverse_video_selection_and_caps_region() {
+        let mut c = core(100);
+        c.resize(Size { rows: 24, cols: 40 });
+        c.pin_rows = 5;
+        c.process(b"\x1b[3;1HRUNNING COMMAND\x1b[6;1HQuestion\x1b[8;1H\x1b[7mFirst option\x1b[9;1Hwrapped description\x1b[0m\x1b[10;1HSecond option\x1b[11;1Hdescription\x1b[12;1HThird option\x1b[13;1Hdescription\x1b[15;1HKeyboard help\x1b[?25l");
+        c.action(Action::PageUp);
+        let (first, dest, height) = c.pin_band().unwrap();
+        assert!(first <= 7 && first + height > 8);
+        let frozen = c.frame().cells[..(dest - 1) * c.size.cols].to_vec();
+        c.process(b"\x1b[8;1H\x1b[0mFirst option\x1b[9;1Hwrapped description\x1b[12;1H\x1b[7mThird option\x1b[13;1Hdescription\x1b[0m\x1b[3;1HCOMMAND UPDATED");
+        let (next, dest, height) = c.pin_band().unwrap();
+        assert!(next > first && next <= 11 && next + height > 12);
+        assert_eq!(c.frame().cells[..(dest - 1) * c.size.cols], frozen);
+        c.action(Action::PinResize(50));
+        let (source, dest, height) = c.pin_band().unwrap();
+        assert_eq!((source, height), (5, 10));
+        let live_text: String = c.frame().cells[dest * c.size.cols..]
+            .iter()
+            .map(|c| c.c)
+            .collect();
+        assert!(!live_text.contains("COMMAND"));
+        assert!(live_text.contains("Question"));
+    }
+
+    #[test]
+    fn enlarged_visible_composer_does_not_swallow_command_output() {
+        let mut c = core(100);
+        c.resize(Size { rows: 24, cols: 40 });
+        c.pin_rows = 20;
+        c.process(b"\x1b[10;1HRUNNING COMMAND\x1b[12;1Hdraft\x1b[?25h");
+        c.action(Action::PageUp);
+        assert_eq!(c.pin_band(), Some((11, 23, 1)));
+    }
+
+    #[test]
+    fn pinned_cursor_band_maps_mouse_back_to_original_rows() {
+        let mut c = core(100);
+        c.resize(Size { rows: 20, cols: 40 });
+        c.pin_rows = 5;
+        c.process(b"\x1b[5;1Hdraft\x1b[?25h\x1b[?1000h\x1b[?1006h");
+        c.action(Action::Scroll(1));
+        let (source, dest, _) = c.pin_band().unwrap();
+        assert_eq!((source, dest), (4, 19));
+        c.action(Action::Mouse {
+            button: 0,
+            col: 2,
+            row: 20,
+            release: false,
+        });
+        assert!(c.pty_out.ends_with(b"\x1b[<0;2;5M"));
+        c.pty_out.clear();
+        c.action(Action::Mouse {
+            button: 0,
+            col: 2,
+            row: 1,
+            release: false,
+        });
+        assert!(c.pty_out.is_empty());
+        c.resize(Size { rows: 2, cols: 2 });
+        assert!(c.pin_band().is_none());
+    }
+
+    #[test]
     fn freeze_survives_repaint_clear_eviction_and_resize() {
         let mut c = core(10);
         for i in 0..30 {
@@ -965,6 +1210,11 @@ mod tests {
         c.tick();
         assert_eq!(c.mode, Mode::Browse);
         assert_eq!(text(&c), before);
+        let original_size = c.size;
+        c.resize(Size { rows: 2, cols: 5 });
+        c.process(b"\x1b[2JMOBILE REPAINT");
+        c.resize(original_size);
+        assert_eq!(text(&c), before, "shrinking must not erase frozen cells");
         c.resize(Size { rows: 7, cols: 30 });
         assert_eq!(&text(&c)[..before.len()], before);
         c.action(Action::Bottom);
@@ -1128,6 +1378,99 @@ mod tests {
         c.action(click);
         assert_eq!(c.mode, Mode::Browse);
         assert_eq!(c.input_mode(), InputMode::Normal);
+    }
+
+    #[test]
+    fn drag_starts_copy_without_click_stealing_keys_and_freezes_press_screen() {
+        let mut c = core(20);
+        c.process(b"abcdef");
+        c.action(Action::Mouse {
+            button: 0,
+            col: 2,
+            row: 1,
+            release: false,
+        });
+        assert_eq!(c.input_mode(), InputMode::Normal);
+        c.process(b"\rXXXXXX");
+        c.action(Action::Mouse {
+            button: 32,
+            col: 5,
+            row: 1,
+            release: false,
+        });
+        c.action(Action::Mouse {
+            button: 0,
+            col: 5,
+            row: 1,
+            release: true,
+        });
+        assert_eq!(c.mode, Mode::Copy);
+        assert_eq!(c.document.as_ref().unwrap().text(true), "bcde");
+        assert!(
+            String::from_utf8(c.controls())
+                .unwrap()
+                .contains(&STANDARD.encode("bcde"))
+        );
+    }
+
+    #[test]
+    fn dragging_into_footer_keeps_selection_and_copies_on_release() {
+        let mut c = core(20);
+        c.process(b"hello");
+        c.action(Action::Mouse {
+            button: 0,
+            col: 1,
+            row: 1,
+            release: false,
+        });
+        c.action(Action::Mouse {
+            button: 32,
+            col: 5,
+            row: c.size.rows as u16 + 1,
+            release: false,
+        });
+        assert_eq!(c.mode, Mode::Copy);
+        c.action(Action::Mouse {
+            button: 0,
+            col: 5,
+            row: c.size.rows as u16 + 1,
+            release: true,
+        });
+        assert_eq!(c.mode, Mode::Copy);
+        assert!(
+            String::from_utf8(c.controls())
+                .unwrap()
+                .contains("\x1b]52;c;")
+        );
+    }
+
+    #[test]
+    fn drag_in_pinned_history_works_even_when_child_tracks_mouse() {
+        let mut c = core(50);
+        c.pin_rows = 6;
+        c.process(b"history text\x1b[?1002h\x1b[?1006h");
+        c.action(Action::PageUp);
+        c.action(Action::Mouse {
+            button: 0,
+            col: 1,
+            row: 1,
+            release: false,
+        });
+        c.action(Action::Mouse {
+            button: 32,
+            col: 7,
+            row: 1,
+            release: false,
+        });
+        c.action(Action::Mouse {
+            button: 0,
+            col: 7,
+            row: 1,
+            release: true,
+        });
+        assert_eq!(c.mode, Mode::Copy);
+        assert_eq!(c.document.as_ref().unwrap().text(true), "history");
+        assert!(c.pty_out.is_empty());
     }
 
     #[test]

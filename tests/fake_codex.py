@@ -129,7 +129,7 @@ def interactive():
             return 0
         write_log("stdin.bin", data)
         all_input.extend(data)
-        for match in re.finditer(rb":(burst|repaint|clear|exit|signal|flood|question)[ \t]*(\d*)[\r\n]", all_input):
+        for match in re.finditer(rb":(burst|repaint|clear|exit|signal|flood|question|alternate)[ \t]*(\d*)[\r\n]", all_input):
             if match.end() <= processed:
                 continue
             processed = match.end()
@@ -169,6 +169,8 @@ def interactive():
                 question_cursor = match.end()
                 write_log("events.log", b"question:open\n")
                 draw_question(0, "")
+            elif command == b"alternate":
+                emit(b"\x1b[?1049h\x1b[HALT-READY\r\n")
         if question is not None:
             question_pending.extend(all_input[question_cursor:])
             question_cursor = len(all_input)

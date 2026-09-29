@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Inspect the kernel lock owner; reconnect or explicitly replace one local TUI."""
+import argparse
+import fcntl
+import os
+from pathlib import Path
+import select
+import signal
+import subprocess
+import sys
+import uuid
+
+
+def lock_path(session):
+    return Path(os.environ.get('CODEX_HOME', str(Path.home()/'.codex')))/'thread-writer-locks'/f'{uuid.UUID(session)}.lock'
+
+
+def owners(path):
+    """An open file alone is not ownership. Require its kernel WRITE lock."""
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return []
+    found = []
+    for process in Path('/proc').iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+            for fd in (process/'fd').iterdir():
+                try:
+                    other = fd.stat()
+                    if (other.st_dev, other.st_ino) != (stat.st_dev, stat.st_ino):
+                        continue
+                    info = (process/'fdinfo'/fd.name).read_text()
+                    if any(line.startswith('lock:') and ' WRITE ' in line
+                           and f' {process.name} ' in line for line in info.splitlines()):
+                        found.append(int(process.name))
+                        break
+                except (FileNotFoundError, PermissionError, ProcessLookupError):
+                    continue
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+    return found
+
+
+def pane_for(pid, socket=None):
+    command = ['tmux'] + (['-S', socket] if socket else [])
+    result = subprocess.run(command+['list-panes', '-a', '-F', '#{pane_pid}\t#{session_id}\t#{window_id}\t#{pane_id}'],
+                            capture_output=True, text=True)
+    rows = [line.split('\t') for line in result.stdout.splitlines()]
+    seen = set()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        for row in rows:
+            if row[0] == str(pid):
+                return row[1:]
+        try:
+            stat = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+            pid = int(stat[1])
+        except (FileNotFoundError, ProcessLookupError):
+            break
+    return None
+
+
+def stop_tui(pid, path):
+    # pidfd pins the process identity across inspection and signalling.
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise RuntimeError("接管需要支持 pidfd 的 Python 3.9+ 和 Linux 5.3+；查询与接入不受影响。")
+    fd = os.pidfd_open(pid)
+    try:
+        process = Path(f'/proc/{pid}')
+        args = (process/'cmdline').read_bytes().split(b'\0')
+        if process.stat().st_uid != os.getuid() or (process/'exe').readlink().name != 'codex':
+            raise RuntimeError('持锁者不是当前用户的 Codex，不会终止。')
+        if b'app-server' in args:
+            raise RuntimeError('持锁者是 app-server，可能承载多个会话。请在原应用关闭该会话；不会终止共享服务。')
+        locks = set()
+        for entry in (process/'fd').iterdir():
+            try:
+                target = entry.readlink()
+                if target.parent == path.parent and target.suffix == '.lock':
+                    info = (process/'fdinfo'/entry.name).read_text()
+                    if any(line.startswith('lock:') and ' WRITE ' in line for line in info.splitlines()):
+                        locks.add(target.name)
+            except FileNotFoundError:
+                continue
+        if locks != {path.name} or owners(path) != [pid]:
+            raise RuntimeError('持锁状态变化或该进程承载多个会话，不会终止；请重新查询。')
+        signal.pidfd_send_signal(fd, signal.SIGTERM)
+        poll = select.poll()
+        poll.register(fd, select.POLLIN)
+        if not poll.poll(5000):
+            raise RuntimeError('已发送 SIGTERM，但进程 5 秒内未退出。未强杀，也未启动第二个写入者。')
+    finally:
+        os.close(fd)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='按 session UUID 查询占用；不读取聊天文本、不删除锁文件。')
+    parser.add_argument('session', help='完整 session UUID')
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument('--attach', action='store_true', help='回到持锁进程所在 tmux 会话')
+    action.add_argument('--takeover', action='store_true', help='终止唯一独立 Codex 写入者，然后 resume；不会终止共享 app-server')
+    parser.add_argument('--socket', help='tmux socket；默认当前 server')
+    parser.add_argument('--wrapper', required=True, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    path = lock_path(args.session)
+    session = path.stem
+    pids = owners(path)
+    if len(pids) > 1:
+        raise RuntimeError('发现多个写入者，不自动接管。')
+    if not args.attach and not args.takeover:
+        if not pids:
+            print(f'{session}: 没有本机写入锁占用，可运行 codex24h resume {session}')
+        for pid in pids:
+            pane = pane_for(pid, args.socket)
+            print(f'{session}: PID {pid}; tmux ' + (':'.join(pane) if pane else '未找到（可能是 app-server 或其他终端）'))
+        return 0
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise RuntimeError('接入或恢复需要交互终端。')
+    if args.attach:
+        if not pids:
+            raise RuntimeError(f'没有持锁进程；请运行 codex24h resume {session}')
+        pane = pane_for(pids[0], args.socket)
+        if not pane:
+            raise RuntimeError('持锁进程不在此 tmux server 中；可用 --socket 指定其他 server。')
+        command = ['tmux'] + (['-S', args.socket] if args.socket else [])
+        command += ['switch-client' if os.environ.get('TMUX') and not args.socket else 'attach-session', '-t', f'{pane[0]}:{pane[1]}.{pane[2]}']
+        if args.socket:
+            os.environ.pop('TMUX', None)
+        os.execvp(command[0], command)
+    if pids:
+        # Do not kill this invoking shell/wrapper or its ancestors.
+        parent = os.getpid()
+        while parent > 1:
+            if parent == pids[0]:
+                raise RuntimeError('不能终止当前命令的父 Codex；请在另一个终端执行。')
+            parent = int(Path(f'/proc/{parent}/stat').read_text().rsplit(')',1)[1].split()[1])
+        stop_tui(pids[0], path)
+    # Check the real lock, including races or owners outside our /proc view.
+    if path.exists():
+        with path.open('r+') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError('会话仍被占用，没有启动新的 Codex。')
+    os.execv(args.wrapper, [args.wrapper, '--no-daemon', 'resume', session])
+
+
+if __name__ == '__main__':
+    # Some Conda builds omit pidfd APIs despite a recent Python version.
+    system_python = Path('/usr/bin/python3')
+    if '--takeover' in sys.argv and not hasattr(os, 'pidfd_open') and system_python.exists() and Path(sys.executable).resolve() != system_python.resolve():
+        os.execv(str(system_python), [str(system_python), __file__, *sys.argv[1:]])
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f'codex24h session: {exc}', file=sys.stderr)
+        sys.exit(1)

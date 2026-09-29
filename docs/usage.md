@@ -28,7 +28,8 @@ codex24h exec --json "your prompt"
 
 | 操作 | 行为 |
 |---|---|
-| 鼠标滚轮、PageUp / PageDown | 浏览历史；下滚到底部恢复跟随 |
+| 鼠标滚轮、不带修饰键的 PageUp / PageDown | 浏览历史；下滚到底部恢复跟随 |
+| Ctrl+]，然后 i / + / - | 固定输入区开关 / 增高两行 / 降低两行 |
 | Ctrl+]，然后 b | 立即回到最新内容 |
 | Ctrl+]，然后 / | 搜索历史 |
 | Ctrl+]，然后 [ | 进入复制模式 |
@@ -37,7 +38,11 @@ codex24h exec --json "your prompt"
 | Ctrl+]，然后 Ctrl+] | 发送原始 Ctrl+] |
 | 点击底部 wrapper 状态条 | 回到最新内容 |
 
-浏览状态下普通输入仍发送给 Codex，但不会自动返回底部。显式进入搜索、复制或帮助模式后，相关按键由 wrapper 处理。粘贴内容不会触发 wrapper 快捷键。
+浏览时默认将光标附近的 6 行原生画面固定在下方，上方历史保持冻结。输入、补全仍交给 Codex，输入光标随实时区域显示；滚轮仍只浏览历史。鼠标点击实时区域时转换回原生坐标，历史区域的点击不发送给应用。
+
+这里固定的是终端单元格，不解析输入框或菜单的业务文本。可见光标用于定位；光标隐藏时使用底部区域。多行草稿、选项或审批对话较高时，用 **Ctrl+] 然后 +** 增大显示区域，或用 **Ctrl+] b** 回到完整实时界面。最多保留两行历史和分隔线；极小窗口会暂时隐藏实时区。搜索、复制和帮助模式保持原来的专用视图。
+
+带 Shift / Ctrl / Alt 的翻页组合键原样交给 Codex。浏览状态下普通输入仍发送给 Codex，但不会自动返回底部。显式进入搜索、复制或帮助模式后，相关按键由 wrapper 处理。粘贴内容不会触发 wrapper 快捷键。
 
 滚轮浏览聊天记录；实时输入框中的上下方向键和 Tab 保持 Codex 原生的历史输入与补全行为。普通点击不会进入复制模式；需要拖选时先按 Ctrl+]，然后 [。浏览历史后按 Ctrl+]，然后 b 回到实时输入框。
 
@@ -70,6 +75,7 @@ Wrapper 选项通过环境变量设置，避免与 Codex 参数重名。
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `CODEX24H_CODEX` | PATH 中的 codex | 指定原版可执行文件，拒绝递归启动自己 |
+| `CODEX24H_PIN_ROWS` | 6 | 浏览时实时输入区行数，0 关闭，范围 0–100 |
 | `CODEX24H_HISTORY` | 10000 | 保留的终端历史行数，范围 1–1000000 |
 | `CODEX24H_ESCAPE_MS` | 100 | 传统终端中单独 Escape 的等待时间，范围 10–2000 ms |
 | `CODEX24H_EXPORT_DIR` | XDG 缓存目录下的 codex24h | 显式文本导出位置 |
@@ -80,9 +86,21 @@ Wrapper 选项通过环境变量设置，避免与 Codex 参数重名。
 
 ## 实现与验证
 
-Rust、portable-pty 0.9.0、alacritty_terminal 0.26.0。一个非阻塞 poll 循环同时处理 PTY、输入、终端输出和信号；慢速外层输出不阻止后台 PTY 解析。正常画面最多 30 fps，冻结状态的后台提示最多 4 fps，用户导航及时响应。
+### SSH 图片粘贴边界
 
-内层是原生 Codex inline TUI，外层是一块虚拟终端画面和固定的一行状态条。协议查询由内层虚拟终端应答；不解析聊天角色、业务文本或 slash command 输出来重建 UI。
+当前没有实现 Windows 剪贴板图片经 SSH 的零配置转发。服务器上的 wrapper 需要终端客户端主动上传图片或实现图片剪贴板协议，不能仅凭一次粘贴按键读取连接电脑的图片。
+
+截至 2026-09-29，Xshell [官方说明](https://netsarang.atlassian.net/wiki/spaces/ENSUP/pages/2237304414/Terminal%2B_%2BAdvanced)中的 OSC 52 是向 Windows 剪贴板复制文本；Termius [桌面更新记录](https://docs.termius.com/changelog/desktop)未找到图片粘贴支持依据。Termius [iOS / iPadOS 文档](https://docs.termius.com/terminal/mobile-terminal#paste-images-and-files)则明确支持后台 SFTP 上传到 `/tmp` 并插入远端路径，但不能据此推断 Windows 版也支持，且本项目尚未实机验证该移动端链路。
+
+本机 Xshell 8.0.0110 已实测：图片剪贴板的 Ctrl+Shift+V / Shift+Insert，以及复制 PNG 文件后的 Ctrl+Shift+V，均未向 SSH 接收端插入图片路径；前后文字粘贴对照正常。这些默认粘贴方式不满足自动图片上传要求。详细过程见 [TESTING.md](../TESTING.md)。
+
+Windows Tabby 1.0.237 + [SSH Image Paste 插件](https://github.com/Vinnish-A/tabby-ssh-image-paste)已验证原生 SSH 图片上传。插件 0.1.3 支持 Ctrl+V / Ctrl+Shift+V，并用 bracketed paste 将图片路径送进 Codex；上传失败显示错误。下载插件 ZIP、完整解压后双击 install.cmd 安装，再完全退出并重新打开 Tabby。默认启动时自动检查 GitHub 更新，可在插件设置中关闭。请使用“配置和连接”中的原生 SSH 连接；在 PowerShell 里运行 ssh 不提供插件所需的 SFTP 会话。
+
+### 终端实现
+
+Rust、portable-pty 0.9.0、alacritty_terminal 0.26.0。一个非阻塞 poll 循环同时处理 PTY、输入、终端输出和信号；慢速外层输出不阻止后台 PTY 解析。正常画面和固定输入区最多 30 fps；关闭实时区时，冻结状态的后台提示最多 4 fps，用户导航及时响应。
+
+内层是原生 Codex inline TUI，外层是一块虚拟终端画面、可选的原生实时区域和一行状态条。协议查询由内层虚拟终端应答；不解析聊天角色、业务文本或 slash command 输出来重建 UI。
 
 ```bash
 cargo test --locked
@@ -102,3 +120,29 @@ CODEX24H_SMOKE_QUESTION=1 cargo run --example native_smoke
 `tests/fake_codex.py` 是可控终端程序，只用于重现高速输出、协议应答、原位重绘、清屏、resize、信号和输入边界。测试程序中的界面文字断言不属于 wrapper 实现。
 
 本项目的验证目标是 Linux / 当前 WSL 本机环境。未在实体手机或 macOS 上运行过的组合，不应仅凭模拟事件测试宣称已经实机验证。
+
+
+## 会话被另一个应用占用
+
+Codex 0.158.0 的 `This conversation is open in another app` 表示它没有取得会话写入锁。原进程退出后可按 `R` 重试；单纯重试不会终止还活着的写入者。不要删除 `thread-writer-locks` 中的文件，删除文件可能让两个进程分别持有不同 inode 的锁。
+
+```bash
+codex24h session <完整-session-UUID>             # 查询内核锁对应的 PID / tmux 窗格
+codex24h session <完整-session-UUID> --attach    # 回到原 tmux 会话，不启动第二个 Codex
+codex24h session <完整-session-UUID> --takeover  # 终止唯一独立写入者，再以 --no-daemon resume
+```
+
+从另一个终端执行接管。只处理当前用户、已核实持锁的单会话 Codex，使用 pidfd 防止 PID 复用误杀，发送 SIGTERM 后最多等 5 秒；不删除锁、不强杀共享 app-server，也不会终止调用命令自身的父 Codex。此入口需要 Linux、Python 3，接管还需要 pidfd API 和支持 `--no-daemon` 的 Codex（已测 0.158.0）。Conda Python 缺少 pidfd 时会尝试系统 `/usr/bin/python3`。
+
+如果占用者是共享 app-server，查询会明确指出；应在原应用关闭该会话。该命令不会为了释放一个 session 终止其他会话。`--attach --socket <路径>` 可选择其他 tmux server。查不到本机锁不能排除其他主机或其他 Codex home 中的占用。
+
+## 鼠标拖选
+
+普通界面可直接左键拖选，移动后才进入复制模式；单击仍保留原生输入框、方向键和 Tab 行为。拖选画面取自按下鼠标时的快照，不受后续输出影响，松开时通过 OSC52 发送所选文本到客户端剪贴板。按 `Esc` 回到浏览，`Ctrl+] b` 回到最新内容。客户端需允许 OSC52；不支持时可按 `e` 导出文字，或按住 `Shift` 用终端自身的鼠标选择和复制。
+
+如果子应用开启了鼠标交互，实时区域仍把鼠标交给子应用；历史区域和显式复制模式仍可选取。Xshell 中 Shift+拖动用于本地选择；Shift+方向键的发送方式由客户端映射决定，不会把未收到的按键猜测成另一种按键。
+
+
+### 固定区的动态范围
+
+`Ctrl+] + / -` 调整的是最大高度。输入光标可见时围绕光标显示；原生菜单隐藏光标时，围绕反显选项及相邻行显示，方向键改变选项后视图跟随。交互区由终端空行分隔限制，内容较少时不会为填满高度而不断向上纳入命令输出。此判断只读取 VT 光标、反显属性和空行；没有反显、没有空行分隔的特殊界面只能回退，不能保证识别任意程序的语义焦点。

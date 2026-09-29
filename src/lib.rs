@@ -4,3 +4,4 @@ pub mod launch;
 pub mod mail;
 pub mod render;
 pub mod terminal;
+pub mod tmux_input;

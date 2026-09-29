@@ -53,11 +53,21 @@ fn pty_size(size: Size) -> PtySize {
 }
 fn run() -> Result<i32> {
     let args: Vec<_> = env::args_os().skip(1).collect();
-    if args.first().is_some_and(|arg| arg == "attach") {
+    if args
+        .first()
+        .is_some_and(|arg| arg == "attach" || arg == "session")
+    {
+        let name = if args[0] == "session" {
+            "codex24h-session"
+        } else {
+            "codex24h-attach"
+        };
         let binary = env::current_exe()?;
-        let mut helper = binary.with_file_name("codex24h-attach");
+        let mut helper = binary.with_file_name(name);
         if !helper.is_file() {
-            helper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/codex24h-attach");
+            helper = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts")
+                .join(name);
         }
         return Err(Command::new("python3")
             .arg(helper)
@@ -68,12 +78,15 @@ fn run() -> Result<i32> {
             .into());
     }
     let attached = env::var_os("CODEX24H_TMUX_CLIENT").is_some();
+    let attached_full_screen = env::var_os("CODEX24H_ATTACH_FULL_SCREEN").is_some_and(|v| v == "1");
+    let mut tmux_input = codex24h::tmux_input::TmuxInput::from_env()?;
     let args = codex24h::mail::arguments(args)?;
     let exe = launch::resolve_codex()?;
     if !terminal::is_tty(0) || !terminal::is_tty(1) || !launch::interactive(&args) {
         return Err(Command::new(exe).args(args).exec().into());
     }
     let history = number("CODEX24H_HISTORY", 10_000, 1, 1_000_000)?;
+    let pin_rows = number("CODEX24H_PIN_ROWS", 6, 0, 100)?;
     let escape_ms = number("CODEX24H_ESCAPE_MS", 100, 10, 2000)?;
     let export_dir = env::var_os("CODEX24H_EXPORT_DIR")
         .map(PathBuf::from)
@@ -111,6 +124,7 @@ fn run() -> Result<i32> {
             caps.background,
             export_dir,
         );
+        core.pin_rows = pin_rows;
         let mut router = Router::new();
         router.set_detachable(attached);
         let mut renderer = Renderer::new();
@@ -154,6 +168,7 @@ fn run() -> Result<i32> {
             &mut router_mode,
             &caps.pending,
             None,
+            &mut tmux_input,
         );
         let mut buf = [0u8; 65536];
         loop {
@@ -188,18 +203,25 @@ fn run() -> Result<i32> {
                 urgent = true;
             }
             if resize.swap(false, Ordering::Relaxed) {
-                let new = terminal::size()?;
-                pair.master.resize(pty_size(new))?;
-                core.resize(new);
-                renderer.invalidate();
-                urgent = true;
+                match terminal::size() {
+                    Ok(new) => {
+                        pair.master.resize(pty_size(new))?;
+                        core.resize(new);
+                        renderer.invalidate();
+                        urgent = true;
+                    }
+                    // A remote client can briefly report no usable cells while
+                    // resizing. Keep the child and its last valid size alive.
+                    Err(e) if e.kind() == io::ErrorKind::InvalidInput => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
             let now = Instant::now();
             if router.has_pending()
                 && now.duration_since(last_input) >= Duration::from_millis(escape_ms as u64)
             {
                 for action in router.flush_timeout() {
-                    core.action(action);
+                    apply_input(&mut core, &mut tmux_input, action);
                 }
                 urgent = true;
             }
@@ -224,12 +246,17 @@ fn run() -> Result<i32> {
                     && frame_due
                     && (urgent
                         || core.mode == Mode::Follow
+                        || (core.mode == Mode::Browse && core.pin_rows > 0)
                         || now.duration_since(last_draw) >= Duration::from_millis(250))
                 {
                     let mut frame = core.frame();
                     if attached && core.mode == Mode::Follow {
-                        frame.status =
-                            "codex24h attached · wheel: history · Ctrl+] d: detach".into();
+                        frame.status = if attached_full_screen {
+                            "codex24h attached · full-screen: history limited · Ctrl+] d: detach"
+                        } else {
+                            "codex24h attached · wheel: history · Ctrl+] d: detach"
+                        }
+                        .into();
                     }
                     if let Some(code) = exit_code {
                         frame.status = format!(
@@ -262,7 +289,11 @@ fn run() -> Result<i32> {
             let mut fds = [
                 libc::pollfd {
                     fd: 0,
-                    events: if child_write.len() - child_pos < 4 * 1024 * 1024 {
+                    events: if child_write.len() - child_pos < 4 * 1024 * 1024
+                        && tmux_input
+                            .as_ref()
+                            .is_none_or(|input| input.pending() < 4 * 1024 * 1024)
+                    {
                         libc::POLLIN
                     } else {
                         0
@@ -288,8 +319,22 @@ fn run() -> Result<i32> {
                     },
                     revents: 0,
                 },
+                tmux_input.as_ref().map_or(
+                    libc::pollfd {
+                        fd: -1,
+                        events: 0,
+                        revents: 0,
+                    },
+                    |input| input.pollfd(),
+                ),
             ];
             terminal::poll(&mut fds, 10)?;
+            if fds[3].revents & (libc::POLLERR | libc::POLLHUP) != 0 && exit_code.is_none() {
+                return Err("tmux input connection closed".into());
+            }
+            if fds[3].revents & libc::POLLOUT != 0 {
+                tmux_input.as_mut().unwrap().flush()?;
+            }
             if fds[0].revents & libc::POLLHUP != 0
                 || fds[2].revents & (libc::POLLERR | libc::POLLHUP) != 0
             {
@@ -307,6 +352,7 @@ fn run() -> Result<i32> {
                             &mut router_mode,
                             &buf[..n],
                             exit_code,
+                            &mut tmux_input,
                         ) {
                             final_screen = Some(core.exit_text());
                             return Ok(exit_code.unwrap_or(0));
@@ -393,6 +439,7 @@ fn route(
     mode: &mut codex24h::input::InputMode,
     bytes: &[u8],
     exit: Option<i32>,
+    tmux_input: &mut Option<codex24h::tmux_input::TmuxInput>,
 ) -> bool {
     // Apply mode transitions between keys even when an SSH packet includes the
     // prefix, search command and search text in a single read.
@@ -404,7 +451,7 @@ fn route(
             {
                 return true;
             }
-            core.action(action);
+            apply_input(core, tmux_input, action);
             let next = core.input_mode();
             if next != *mode {
                 *mode = next;
@@ -414,6 +461,17 @@ fn route(
         actions = router.drain_step();
     }
     router.detach_requested()
+}
+fn apply_input(
+    core: &mut Core,
+    tmux_input: &mut Option<codex24h::tmux_input::TmuxInput>,
+    action: Action,
+) {
+    if let (Some(input), Action::Forward(bytes)) = (tmux_input.as_mut(), &action) {
+        input.enqueue(bytes);
+    } else {
+        core.action(action);
+    }
 }
 fn child_exit_code(status: &portable_pty::ExitStatus) -> i32 {
     if let Some(name) = status.signal() {

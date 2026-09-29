@@ -4,7 +4,7 @@
 
 > 用刷短视频的时间刷会 codex
 
-Codex CLI 的轻量终端包装器，提供稳定的滚动和历史浏览。上翻后画面保持不动，Codex 在后台继续输出；滚动到底部后恢复跟随。
+Codex CLI 的轻量终端包装器，提供稳定的滚动和历史浏览。上翻后历史保持不动，下方保留实时输入区，Codex 在后台继续输出；滚动到底部后恢复跟随。
 
 使用本机 Codex 和现有登录，保留原生输入框、补全、模型选择、审批等交互。
 
@@ -38,8 +38,9 @@ codex24h resume --last
 | 返回最新内容 | 下滚到底部，或 Ctrl+] 然后 b |
 | 召回历史输入 | 输入框中的 ↑ / ↓ |
 | 原生补全 | Tab |
+| 固定输入区开关 / 调整高度 | Ctrl+] 然后 i / + / - |
 | 搜索历史 | Ctrl+] 然后 / |
-| 复制 | Ctrl+] 然后 [，选中后按 y |
+| 复制 | 鼠标拖选后松开；或 Ctrl+] 然后 [，选中后按 y |
 | 帮助 | Ctrl+] 然后 ? |
 
 手机触控滚动需要 SSH 客户端支持发送滚轮事件，否则可使用软键盘翻页。`resume` 的可浏览历史仅包含 Codex 本次实际输出的内容，暂不支持完整历史补齐。
@@ -51,13 +52,13 @@ codex24h attach --list
 codex24h attach <PID>
 ```
 
-按 Ctrl+] 然后 d 断开，原任务继续运行。这是实验功能，需要 tmux、Python 3 和 `tic`；暂不支持直接启动在普通终端里的进程，也不会补齐接入前的历史。详见[接入说明](docs/attach.md)。
+按 Ctrl+] 然后 d 断开，原任务继续运行。需要 tmux、Python 3 和 `tic`。**全屏模式下可能只有画面冻结，没有可翻的聊天历史**，`--list` 会标注；普通终端进程暂不支持接入。新会话仍建议直接用 `codex24h`。详见[接入说明](docs/attach.md)。
 
 ## 图片粘贴
 
-通过 SSH 使用时，建议选择 [Tabby](https://tabby.sh)，并安装 [tabby-ssh-image-paste](https://github.com/Vinnish-A/tabby-ssh-image-paste)。Windows 上复制截图后，在远程 Codex 输入框按 `Ctrl+Shift+V`，插件会通过当前连接的 SFTP 上传图片并填入路径，供 Codex 识别为附件。
+通过 SSH 使用时，建议选择 [Tabby](https://tabby.sh)，并安装 [tabby-ssh-image-paste](https://github.com/Vinnish-A/tabby-ssh-image-paste)。Windows 上复制截图后，在远程 Codex 输入框按 `Ctrl+V` 或 `Ctrl+Shift+V`，插件会通过当前连接的 SFTP 上传图片并填入路径，供 Codex 识别为附件。
 
-服务器需支持 SFTP，且 `/tmp` 可写；无需额外登录或服务端插件。插件尚未上架商店，按其 [安装说明](https://github.com/Vinnish-A/tabby-ssh-image-paste#安装到-windows-tabby) 下载并放入 Tabby 插件目录即可。
+服务器需支持 SFTP，且 `/tmp` 可写；无需额外登录或服务端插件。插件尚未上架商店，按其 [安装说明](https://github.com/Vinnish-A/tabby-ssh-image-paste#安装到-windows-tabby) 下载 ZIP，解压后双击 `install.cmd`，再重启 Tabby。插件默认自动检查 GitHub 更新，可在设置中关闭。
 
 ## 邮件通知
 

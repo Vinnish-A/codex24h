@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Attach an existing tmux terminal without migrating or restarting its process."""
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -20,8 +21,32 @@ def tmux(socket, *args):
 
 def panes(socket):
     # Fixed fields only; no titles, shell text or Codex transcript parsing.
-    fields = '#{pane_pid}\t#{pane_id}\t#{pane_tty}\t#{session_id}\t#{window_id}\t#{window_panes}\t#{pane_in_mode}\t#{pane_current_command}'
+    fields = '#{pane_pid}\t#{pane_id}\t#{pane_tty}\t#{session_id}\t#{window_id}\t#{window_panes}\t#{pane_in_mode}\t#{pane_current_command}\t#{alternate_on}'
     return [row.split('\t') for row in tmux(socket, 'list-panes', '-a', '-F', fields).splitlines()]
+
+
+def cleanup_session(socket, session):
+    # Serialise our detach decisions: two clients must not both see the other
+    # as the last remaining owner and then delete both sessions. flock releases
+    # automatically even if this supervisor is killed during cleanup.
+    cache = Path(os.environ.get('XDG_CACHE_HOME', str(Path.home()/'.cache')))/'codex24h'
+    cache.mkdir(parents=True, exist_ok=True)
+    fd = os.open(cache/'attach-cleanup.lock', os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    with os.fdopen(fd, 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # Another attachment may have been selected as our source. Inspect
+        # actual window references instead of one source session's existence.
+        references = subprocess.run(['tmux', '-S', socket, 'list-windows', '-a', '-F',
+                                     '#{session_id}\t#{window_id}'], capture_output=True, text=True)
+        if references.returncode == 0:
+            windows = [row.split('\t') for row in references.stdout.splitlines()]
+            ours = {window for owner, window in windows if owner == session}
+            shared = {window for owner, window in windows if owner != session}
+            if ours and ours <= shared:
+                subprocess.run(['tmux', '-S', socket, 'kill-session', '-t', session],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif ours:
+                print(f'保留连接会话 {session}：其中有窗口已无其他会话承载，以免结束任务。', file=sys.stderr)
 
 
 def main():
@@ -31,6 +56,8 @@ def main():
         env = dict(os.environ, TERM='codex24h-attach', TERMINFO=terminfo)
         env.pop('TMUX', None)
         env.pop('CODEX24H_TMUX_CLIENT', None)
+        env.pop('CODEX24H_ATTACH_FULL_SCREEN', None)
+        env.pop('CODEX24H_TMUX_INPUT', None)
         os.execvpe('tmux', ['tmux', '-S', socket, 'attach-session', '-E', '-f', 'active-pane',
                            '-t', session, ';', 'select-pane', '-t', pane], env)
 
@@ -57,9 +84,12 @@ def main():
             socket = result.stdout.strip()
     available = panes(socket)
     if args.list:
-        print('PANE_PID\tPANE\tCOMMAND')
-        for pid, pane, _, _, _, _, _, command in available:
-            print(f'{pid}\t{pane}\t{command}')
+        print('PANE_PID\tPANE\tCOMMAND\tSCREEN')
+        seen = set()
+        for pid, pane, _, _, _, _, _, command, alternate in available:
+            if pane not in seen:
+                print(f'{pid}\t{pane}\t{command}\t'+('full-screen (history limited)' if alternate == '1' else 'inline'))
+                seen.add(pane)
         return 0
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise RuntimeError('attach 需要交互终端。请在另一个终端中运行此命令。')
@@ -70,7 +100,7 @@ def main():
     candidates = [row for row in available if row[2] == tty]
     if not candidates:
         raise RuntimeError('目标不在此 tmux server 中。可用 --socket 指定其他 server；普通终端进程暂不支持安全接管。')
-    _, pane, tty, source, window, count, in_mode, command = candidates[0]
+    _, pane, tty, source, window, count, in_mode, command, alternate = candidates[0]
     if tty == os.ttyname(0):
         raise RuntimeError('不能从目标自身的终端接入。请在另一个终端或窗格执行 attach。')
     if count != '1':
@@ -97,6 +127,7 @@ def main():
         session = tmux(socket, 'new-session', '-d', '-P', '-F', '#{session_id}',
                        '-s', f'codex24h-attach-{os.getpid()}', '-t', source)
         child = None
+        control = None
         try:
             tmux(socket, 'set-option', '-t', session, 'status', 'off', ';',
                  'set-option', '-t', session, 'prefix', 'None', ';',
@@ -104,8 +135,20 @@ def main():
                  'set-option', '-t', session, 'destroy-unattached', 'off', ';',
                  'select-window', '-t', f'{session}:{window}')
             env = dict(os.environ, CODEX24H_CODEX=str(Path(__file__).resolve()), CODEX24H_MAIL='0',
+                       CODEX24H_ATTACH_FULL_SCREEN=alternate,
                        CODEX24H_TMUX_CLIENT=json.dumps([socket, session, pane, terminfo]))
-            child = subprocess.Popen([args.wrapper], env=env)
+            # A persistent control connection writes literal bytes to the pane.
+            # The normal tmux client would otherwise reinterpret modified keys
+            # and swallow CSI-u/modifyOtherKeys on older tmux versions.
+            control_env = dict(os.environ)
+            control_env.pop('TMUX', None)
+            control = subprocess.Popen(['tmux', '-S', socket, '-C', 'attach-session', '-E',
+                                        '-f', 'no-output,ignore-size', '-t', session],
+                                       stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                       env=control_env)
+            input_fd = control.stdin.fileno()
+            env['CODEX24H_TMUX_INPUT'] = f'{input_fd}:{pane}'
+            child = subprocess.Popen([args.wrapper], env=env, pass_fds=(input_fd,))
 
             def forward(signum, _frame):
                 if child.poll() is None:
@@ -119,15 +162,12 @@ def main():
             if child and child.poll() is None:
                 child.terminate()
                 child.wait(timeout=5)
-            # If the original session was removed while attached, keep our
-            # session: deleting its last window reference would kill the task.
-            existing = subprocess.run(['tmux', '-S', socket, 'has-session', '-t', source],
-                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if existing.returncode == 0:
-                subprocess.run(['tmux', '-S', socket, 'kill-session', '-t', session],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
-                print(f'原 tmux 会话已关闭；保留连接会话 {session}，以免结束任务。', file=sys.stderr)
+            if control:
+                control.stdin.close()
+                if control.poll() is None:
+                    control.terminate()
+                control.wait(timeout=5)
+            cleanup_session(socket, session)
 
 
 if __name__ == '__main__':

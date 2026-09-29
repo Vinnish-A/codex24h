@@ -17,6 +17,8 @@ pub enum Action {
     PageUp,
     PageDown,
     Bottom,
+    PinToggle,
+    PinResize(i32),
     CopyMode,
     Search,
     Help,
@@ -259,6 +261,9 @@ impl Router {
                 match command_char(&token) {
                     Some('d') if self.detachable => self.detach_requested = true,
                     Some('b') => out.push(Action::Bottom),
+                    Some('i') => out.push(Action::PinToggle),
+                    Some('+') | Some('=') => out.push(Action::PinResize(2)),
+                    Some('-') => out.push(Action::PinResize(-2)),
                     Some('/') => out.push(Action::Search),
                     Some('[') => out.push(Action::CopyMode),
                     Some('?') => out.push(Action::Help),
@@ -430,7 +435,14 @@ fn normal_action(token: &[u8]) -> Option<Action> {
         }
         return mouse_action(button, col, row, final_byte == b'm');
     }
-    let key = params.split(|&b| b == b';').next()?;
+    let mut fields = params.split(|&b| b == b';');
+    let key = fields.next()?;
+    let modifiers = fields.next().unwrap_or(b"1").split(|b| *b == b':').next()?;
+    // Only bare paging keys belong to the wrapper. Modified paging keys are
+    // application shortcuts, just like modified arrows and function keys.
+    if modifiers != b"1" && !modifiers.is_empty() {
+        return None;
+    }
     match final_byte {
         b'~' => match key {
             b"5" => Some(Action::PageUp),
@@ -711,6 +723,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pin_commands_do_not_consume_native_letters() {
+        let mut r = Router::new();
+        assert_eq!(
+            r.feed(b"\x1di\x1d+\x1d-"),
+            vec![
+                Action::PinToggle,
+                Action::PinResize(2),
+                Action::PinResize(-2)
+            ]
+        );
+        assert_eq!(r.feed(b"i+-"), vec![Action::Forward(b"i+-".to_vec())]);
+    }
+
+    #[test]
     fn detach_is_attach_only_and_never_triggered_by_paste() {
         let mut router = Router::new();
         assert_eq!(
@@ -780,8 +806,8 @@ mod tests {
                 },
             ),
             (b"\x1b[M`-?".as_slice(), Action::Scroll(3)),
-            (b"\x1b[5;3~".as_slice(), Action::PageUp),
-            (b"\x1b[6;2:1~".as_slice(), Action::PageDown),
+            (b"\x1b[5;1~".as_slice(), Action::PageUp),
+            (b"\x1b[6;1:1~".as_slice(), Action::PageDown),
         ];
         for (bytes, expected) in cases {
             for split in 0..=bytes.len() {
@@ -920,7 +946,8 @@ mod tests {
     #[test]
     fn shifted_f3_and_unreserved_kitty_keys_remain_child_input() {
         let mut router = Router::new();
-        let bytes = b"\x1b[1;2R\x1b[128512;3u\x1b[99;5u";
+        let bytes =
+            b"\x1b[1;2R\x1b[128512;3u\x1b[99;5u\x1b[1;2D\x1b[Z\x1b[5;3~\x1b[6;2:1~\x1b[57421;2u";
         assert_eq!(router.feed(bytes), vec![Action::Forward(bytes.to_vec())]);
     }
 

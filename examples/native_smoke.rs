@@ -87,6 +87,7 @@ impl Session {
         command.args(args);
         command.cwd(root);
         command.env("TERM", "xterm-256color");
+        command.env("CODEX24H_PIN_ROWS", "0"); // Original full-frame freeze suite.
         let child = pair.slave.spawn_command(command)?;
         drop(pair.slave);
         let mut pty_reader = pair.master.try_clone_reader()?;

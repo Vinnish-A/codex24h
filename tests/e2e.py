@@ -199,7 +199,7 @@ class WrapperE2E(unittest.TestCase):
         self.env = os.environ.copy()
         self.env.update(
             CODEX24H_CODEX=str(FAKE), FAKE_LOG_DIR=self.temp.name,
-            CODEX24H_HISTORY="40", CODEX24H_MAIL="0", TERM="xterm-256color",
+            CODEX24H_HISTORY="40", CODEX24H_MAIL="0", CODEX24H_PIN_ROWS="0", TERM="xterm-256color",
         )
 
     def log(self, name):
@@ -239,6 +239,21 @@ class WrapperE2E(unittest.TestCase):
         while time.monotonic() < end and process_state(pid) is not None:
             time.sleep(0.02)
         self.assertIsNone(process_state(pid), f"child PID {pid} survived wrapper exit")
+
+    def test_transient_tiny_resize_preserves_running_child(self):
+        terminal = Terminal(self.env)
+        self.addCleanup(terminal.close)
+        terminal.until('READY')
+        child = self.child_pid()
+        for rows, cols in ((0, 0), (1, 80), (24, 1)):
+            terminal.resize(rows, cols)
+            terminal.drain(.15)
+            self.assertIsNone(terminal.process.poll(), 'temporary terminal size terminated wrapper')
+            os.kill(child, 0)
+        terminal.resize(24, 80)
+        terminal.send(b'after-resize')
+        terminal.drain(.3)
+        self.assertIn(b'after-resize', self.log('stdin.bin'))
 
     def test_direct_pipe_preserves_bytes_args_and_status(self):
         env = dict(self.env, FAKE_MODE="direct", FAKE_EXIT="17")
@@ -303,6 +318,14 @@ class WrapperE2E(unittest.TestCase):
         self.wait_log("events.log", b"burst:120")
         frozen = terminal.drain(0.4)
         self.assertNotIn("NEW-120", visible(frozen), "live chat content repainted during browse")
+
+        preserved = screen_text(terminal.output)[:-1]
+        terminal.resize(10, 30)
+        terminal.drain(.2)
+        terminal.resize(24, 80)
+        terminal.drain(.2)
+        self.assertEqual(screen_text(terminal.output)[:-1], preserved,
+                         "shrinking then restoring erased frozen content")
 
         terminal.send(b":repaint\n:clear\n")
         self.wait_log("events.log", b"clear")
@@ -442,6 +465,19 @@ class WrapperE2E(unittest.TestCase):
         ask(b"4\x1b[200~Please explain first\x1b[201~\r", b"free:Please explain first")
         terminal.send(b":exit 0\n")
         self.assertEqual(terminal.wait_draining(), 0)
+
+    def test_modified_shortcuts_remain_exact_without_tmux(self):
+        terminal = Terminal(self.env)
+        self.addCleanup(terminal.close)
+        terminal.until("READY-080")
+        terminal.drain(.2)
+        before = len(self.log("stdin.bin"))
+        keys = b"\x1b[1;2D\x1b[1;2C\x1b[Z\x1b[13;2u\x1b[27;2;13~\x1b[5;2~\x1b[6;5~"
+        for start in range(0, len(keys), 3):
+            terminal.send(keys[start:start+3])
+            terminal.drain(.02)
+        self.wait_log("stdin.bin", keys)
+        self.assertEqual(self.log("stdin.bin")[before:], keys)
 
     def test_question_frozen_then_revealed_and_answered(self):
         terminal = Terminal(self.env)
