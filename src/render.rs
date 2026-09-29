@@ -4,13 +4,6 @@ use alacritty_terminal::term::cell::{Cell, Flags, Hyperlink};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 use unicode_width::UnicodeWidthChar;
 
-/// Inclusive viewport coordinates, in row/column order.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Selection {
-    pub start: (usize, usize),
-    pub end: (usize, usize),
-}
-
 #[derive(Clone, Debug)]
 pub struct Frame {
     /// Child content height. The renderer uses one additional physical row for status.
@@ -21,7 +14,6 @@ pub struct Frame {
     /// DECSCUSR shape (0–6).
     pub cursor_shape: u8,
     pub status: String,
-    pub selection: Option<Selection>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,11 +52,7 @@ impl Renderer {
             for col in 0..frame.cols {
                 let index = row * frame.cols + col;
                 let cell = &frame.cells[index];
-                let selected = cell_selected(frame, row, col);
-                let dirty = full
-                    || old.is_some_and(|p| {
-                        p.cells[index] != *cell || cell_selected(p, row, col) != selected
-                    });
+                let dirty = full || old.is_some_and(|p| p.cells[index] != *cell);
                 if !dirty
                     || cell.flags.contains(Flags::WIDE_CHAR_SPACER)
                         && col > 0
@@ -101,11 +89,7 @@ impl Renderer {
                     fg: cell.fg,
                     bg: cell.bg,
                     underline_color: cell.underline_color(),
-                    flags: if selected {
-                        cell.flags ^ Flags::INVERSE
-                    } else {
-                        cell.flags
-                    },
+                    flags: cell.flags,
                 };
                 if style != Some(next_style) {
                     emit_style(&mut out, next_style);
@@ -191,26 +175,6 @@ impl Renderer {
 impl Default for Renderer {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-fn is_selected(selection: Option<Selection>, row: usize, col: usize) -> bool {
-    selection.is_some_and(|s| {
-        let (start, end) = if s.start <= s.end {
-            (s.start, s.end)
-        } else {
-            (s.end, s.start)
-        };
-        (row, col) >= start && (row, col) <= end
-    })
-}
-
-fn cell_selected(frame: &Frame, row: usize, col: usize) -> bool {
-    let index = row * frame.cols + col;
-    if frame.cells[index].flags.contains(Flags::WIDE_CHAR) && col + 1 < frame.cols {
-        is_selected(frame.selection, row, col) || is_selected(frame.selection, row, col + 1)
-    } else {
-        is_selected(frame.selection, row, col)
     }
 }
 
@@ -351,7 +315,6 @@ mod tests {
             cursor: None,
             cursor_shape: 1,
             status: String::new(),
-            selection: None,
         }
     }
 
@@ -420,23 +383,6 @@ mod tests {
         let output = String::from_utf8(renderer.render(&f)).unwrap();
         assert!(output.contains("\x1b[2;1H\x1b[0;7m界a"));
         assert!(!output.contains("界ab"));
-    }
-
-    #[test]
-    fn selecting_wide_spacer_repaints_leading_glyph() {
-        let mut renderer = Renderer::new();
-        let mut f = frame(3);
-        f.cells[0].c = '界';
-        f.cells[0].flags = Flags::WIDE_CHAR;
-        f.cells[1].flags = Flags::WIDE_CHAR_SPACER;
-        renderer.render(&f);
-        f.selection = Some(Selection {
-            start: (0, 1),
-            end: (0, 1),
-        });
-        let output = String::from_utf8(renderer.render(&f)).unwrap();
-        assert!(output.contains("\x1b[1;1H\x1b[0;7;39;49m界"));
-        assert!(!output.contains("\x1b[1;2H"));
     }
 
     #[test]

@@ -260,6 +260,8 @@ class WrapperE2E(unittest.TestCase):
         self.wait_log('stdin.bin', b'\x1b[A\t')
         before = beat()
         self.assertGreater(beat(), before)
+        self.assertNotIn(b'\x1b]52;', terminal.output)
+        self.assertNotIn('Sent ', visible(terminal.output))
         terminal.send(b'\x03')
         self.wait_log('stdin.bin', b'\x03')
         terminal.send(b':exit 0\n')
@@ -523,7 +525,7 @@ class WrapperE2E(unittest.TestCase):
         terminal.send(b":exit 0\n")
         self.assertEqual(terminal.wait_draining(), 0)
 
-    def test_search_and_copy_keys_cannot_answer_child_question(self):
+    def test_search_keys_cannot_answer_child_question(self):
         terminal = Terminal(self.env)
         self.addCleanup(terminal.close)
         terminal.until("READY-080")
@@ -534,7 +536,7 @@ class WrapperE2E(unittest.TestCase):
         before = self.log("stdin.bin")
         terminal.send(b"\x1d/ROW-070")
         terminal.until("/ROW-070")
-        terminal.send(b"\rjk")  # Search accepts; j/k stay in local Copy mode.
+        terminal.send(b"\rjk")  # Search accepts; j/k stay in local search results.
         terminal.drain(0.2)
         self.assertEqual(self.log("stdin.bin"), before)
         self.assertEqual(self.log("answer.log"), b"")
@@ -550,7 +552,7 @@ class WrapperE2E(unittest.TestCase):
         self.wait_event_count(b"question:open", count)
         terminal.drain(0.2)
         before = self.log("stdin.bin")
-        terminal.send(b"\x1d[jk")  # Enter Copy directly; navigation is local.
+        terminal.send(b"\x1d/ROW-070\rjk")  # Search navigation stays local.
         terminal.drain(0.2)
         self.assertEqual(self.log("stdin.bin"), before)
         self.assertEqual(self.log("answer.log").count(b"option:"), 1)

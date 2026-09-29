@@ -49,7 +49,7 @@ impl EventListener for Events {
 pub enum Mode {
     Follow,
     Browse,
-    Copy,
+    SearchResults,
     Search,
     Help,
 }
@@ -60,7 +60,6 @@ struct Document {
     cols: usize,
     top: usize,
     cursor: (usize, usize),
-    anchor: Option<(usize, usize)>,
 }
 impl Document {
     fn row_chars(&self, row: usize, lo: usize, hi: usize) -> Vec<(char, usize)> {
@@ -81,38 +80,6 @@ impl Document {
             }
         }
         chars
-    }
-
-    fn text(&self, selection: bool) -> String {
-        let (start, end) = if selection {
-            let a = self.anchor.unwrap_or((self.cursor.0, 0));
-            let b = if self.anchor.is_some() {
-                self.cursor
-            } else {
-                (self.cursor.0, self.cols - 1)
-            };
-            (a.min(b), a.max(b))
-        } else {
-            ((0, 0), (self.rows.len() - 1, self.cols - 1))
-        };
-        let mut out = String::new();
-        for row in start.0..=end.0 {
-            let lo = if row == start.0 { start.1 } else { 0 };
-            let hi = if row == end.0 { end.1 } else { self.cols - 1 };
-            let mut chars = self.row_chars(row, lo, hi);
-            // A soft wrap is part of the same logical line. Its spaces are
-            // content; trimming them would join words on copy.
-            if row == end.0 || !self.wrapped[row] {
-                while chars.last().is_some_and(|(ch, _)| *ch == ' ') {
-                    chars.pop();
-                }
-            }
-            out.extend(chars.into_iter().map(|(ch, _)| ch));
-            if row != end.0 && !self.wrapped[row] {
-                out.push('\n');
-            }
-        }
-        out
     }
 
     fn find(
@@ -175,8 +142,6 @@ pub struct Core {
     pub dirty: bool,
     pub query: String,
     note: String,
-    mouse_press: Option<(u16, u16, Frame)>,
-    drag_return: Option<Mode>,
     history_limit: usize,
     foreground: Rgb,
     background: Rgb,
@@ -219,8 +184,6 @@ impl Core {
             dirty: true,
             query: String::new(),
             note: String::new(),
-            mouse_press: None,
-            drag_return: None,
             history_limit: history,
             foreground,
             background,
@@ -230,8 +193,7 @@ impl Core {
         }
     }
     pub fn input_mode(&self) -> InputMode {
-        if self.drag_return.is_none() && matches!(self.mode, Mode::Copy | Mode::Search | Mode::Help)
-        {
+        if matches!(self.mode, Mode::SearchResults | Mode::Search | Mode::Help) {
             InputMode::Local
         } else {
             InputMode::Normal
@@ -443,7 +405,6 @@ impl Core {
             cursor: None,
             cursor_shape: 0,
             status: String::new(),
-            selection: None,
         });
         self.dirty = true;
     }
@@ -453,7 +414,6 @@ impl Core {
         self.frozen = None;
         self.document = None;
         self.unread = 0;
-        self.drag_return = None;
         self.note.clear();
         self.dirty = true;
     }
@@ -520,17 +480,10 @@ impl Core {
             cols: self.size.cols,
             top,
             cursor: (top, 0),
-            anchor: None,
         });
     }
     pub fn action(&mut self, action: Action) {
         self.dirty = true;
-        if !matches!(&action, Action::Mouse { .. } | Action::TerminalReply(_)) {
-            self.mouse_press = None;
-            // Mouse-up may be lost when releasing outside the terminal. A key
-            // cancels this temporary selection and keeps its native meaning.
-            self.finish_drag();
-        }
         match action {
             Action::Forward(bytes) => self.pty_out.extend(bytes),
             Action::TerminalReply(bytes) => {
@@ -565,11 +518,8 @@ impl Core {
                     }
                     _ => unreachable!(),
                 };
-                if matches!(self.mode, Mode::Copy | Mode::Search | Mode::Help) {
+                if matches!(self.mode, Mode::SearchResults | Mode::Search | Mode::Help) {
                     self.leave_local();
-                    if let Some(doc) = &mut self.document {
-                        doc.anchor = None;
-                    }
                 }
                 self.note = format!(
                     "Live input max: {} rows{}",
@@ -580,11 +530,6 @@ impl Core {
                         ""
                     }
                 );
-            }
-            Action::CopyMode => {
-                self.document();
-                self.mode = Mode::Copy;
-                self.note.clear();
             }
             Action::Search => {
                 self.document();
@@ -601,77 +546,21 @@ impl Core {
             Action::QuitBrowse => self.bottom(),
             Action::LocalKey(key) => self.local_key(key),
             Action::Mouse {
-                mut button,
+                button,
                 col,
                 mut row,
-                mut release,
+                release,
             } => {
-                // X10 reports mouse-up as button 3, rather than naming the
-                // released button. Also recover a no-buttons motion event.
-                if button & 3 == 3 && button & 64 == 0 && self.drag_return.is_some() {
-                    button &= !35;
-                    release = true;
-                }
-                // Right-click belongs to the SSH client's menu/paste behavior.
-                if button & 0x43 == 2 {
-                    self.finish_drag();
-                    self.mouse_press = None;
+                // Selection and copying belong to the client. Do not capture
+                // drags, freeze the display, or write to its clipboard.
+                if button & 0x43 == 2 || row as usize > self.size.rows {
                     return;
                 }
-                if row as usize > self.size.rows {
-                    if button & 3 == 0 && (self.mode == Mode::Copy || self.mouse_press.is_some()) {
-                        row = self.size.rows as u16;
-                    } else {
-                        if !release && button & 35 == 0 {
-                            self.bottom();
-                        }
-                        return;
-                    }
-                }
-                // A click must not steal composer keys. Start copy mode only
-                // after a left-button drag, using the screen seen on mouse-down.
                 let band = self.pin_band();
                 let live_band = band.is_some_and(|(_, dest, _)| row as usize > dest);
                 let application_mouse = (self.mode == Mode::Follow || live_band)
                     && self.term.mode().intersects(TermMode::MOUSE_MODE);
-                if !application_mouse
-                    && button & 3 == 0
-                    && matches!(self.mode, Mode::Follow | Mode::Browse)
-                {
-                    if !release && button & 32 == 0 {
-                        self.mouse_press = Some((col, row, self.frame()));
-                        return;
-                    }
-                    if let Some((start_col, start_row, frame)) = self.mouse_press.take() {
-                        if (col, row) == (start_col, start_row) {
-                            if !release {
-                                self.mouse_press = Some((start_col, start_row, frame));
-                            }
-                            return;
-                        }
-                        self.document();
-                        let doc = self.document.as_mut().unwrap();
-                        for r in 0..frame.rows {
-                            if doc.top + r < doc.rows.len() {
-                                let cells =
-                                    frame.cells[r * frame.cols..(r + 1) * frame.cols].to_vec();
-                                doc.wrapped[doc.top + r] = cells
-                                    .last()
-                                    .is_some_and(|c| c.flags.contains(Flags::WRAPLINE));
-                                doc.rows[doc.top + r] = cells;
-                            }
-                        }
-                        doc.anchor = Some((
-                            doc.top + start_row.saturating_sub(1) as usize,
-                            (start_col.saturating_sub(1) as usize).min(doc.cols - 1),
-                        ));
-                        self.drag_return = Some(self.mode);
-                        self.mode = Mode::Copy;
-                        self.note.clear();
-                    }
-                }
                 if application_mouse {
-                    self.mouse_press = None;
                     if let Some((source, dest, _)) = band {
                         row = (source + row as usize - dest) as u16;
                     }
@@ -701,42 +590,6 @@ impl Core {
                             row as u8 + 32,
                         ]);
                     }
-                } else if self.mode == Mode::Copy && button & 3 == 0 {
-                    self.document();
-                    self.mode = Mode::Copy;
-                    let doc = self.document.as_mut().unwrap();
-                    let point = (
-                        (doc.top + row.saturating_sub(1) as usize).min(doc.rows.len() - 1),
-                        (col.saturating_sub(1) as usize).min(doc.cols - 1),
-                    );
-                    if button & 32 == 0 && !release {
-                        doc.anchor = Some(point);
-                    }
-                    doc.cursor = point;
-                    if release && doc.anchor.is_some() {
-                        let text = doc.text(true);
-                        if !text.trim().is_empty() {
-                            self.clipboard(&text);
-                        }
-                        self.finish_drag();
-                        self.note = if text.trim().is_empty() {
-                            "Empty selection; clipboard unchanged".into()
-                        } else {
-                            format!("Sent {} bytes to client clipboard (OSC52)", text.len())
-                        };
-                    }
-                }
-            }
-        }
-    }
-    fn finish_drag(&mut self) {
-        if let Some(mode) = self.drag_return.take() {
-            if mode == Mode::Follow {
-                self.bottom();
-            } else {
-                self.mode = mode;
-                if let Some(doc) = &mut self.document {
-                    doc.anchor = None;
                 }
             }
         }
@@ -761,7 +614,7 @@ impl Core {
             match key {
                 Key::Escape | Key::Ctrl(3) => self.leave_local(),
                 Key::Enter => {
-                    self.mode = Mode::Copy;
+                    self.mode = Mode::SearchResults;
                     self.find(false, false);
                 }
                 Key::Backspace => {
@@ -800,38 +653,12 @@ impl Core {
                 self.find(true, true);
                 return;
             }
-            Key::Char('y') | Key::Enter => {
-                let text = self.document.as_ref().unwrap().text(true);
-                if !text.trim().is_empty() {
-                    self.clipboard(&text);
-                }
-                self.leave_local();
-                if let Some(doc) = &mut self.document {
-                    doc.anchor = None;
-                }
-                self.note = if text.trim().is_empty() {
-                    "Empty selection; clipboard unchanged".into()
-                } else {
-                    format!(
-                        "Sent {} bytes to client clipboard (OSC52) · Esc: browse",
-                        text.len()
-                    )
-                };
-                return;
-            }
             _ => {}
         }
         let Some(doc) = &mut self.document else {
             return;
         };
         match key {
-            Key::Char('v') => {
-                doc.anchor = if doc.anchor.is_some() {
-                    None
-                } else {
-                    Some(doc.cursor)
-                };
-            }
             Key::Up | Key::Char('k') => doc.cursor.0 = doc.cursor.0.saturating_sub(1),
             Key::Down | Key::Char('j') => doc.cursor.0 = (doc.cursor.0 + 1).min(doc.rows.len() - 1),
             Key::Left | Key::Char('h') => doc.cursor.1 = doc.cursor.1.saturating_sub(1),
@@ -922,17 +749,10 @@ impl Core {
     pub fn frame(&self) -> Frame {
         let mut frame = if let Some(doc) = &self.document {
             let mut cells = vec![Cell::default(); self.size.rows * self.size.cols];
-            let selection = doc.anchor.map(|a| (a.min(doc.cursor), a.max(doc.cursor)));
             for r in 0..self.size.rows {
                 if let Some(row) = doc.rows.get(doc.top + r) {
                     for (c, cell) in row.iter().take(self.size.cols).enumerate() {
-                        let mut cell = cell.clone();
-                        if selection
-                            .is_some_and(|(a, b)| (doc.top + r, c) >= a && (doc.top + r, c) <= b)
-                        {
-                            cell.flags.toggle(Flags::INVERSE);
-                        }
-                        cells[r * self.size.cols + c] = cell;
+                        cells[r * self.size.cols + c] = cell.clone();
                     }
                 }
             }
@@ -946,7 +766,6 @@ impl Core {
                 )),
                 cursor_shape: 2,
                 status: String::new(),
-                selection: None,
             }
         } else if self.mode != Mode::Follow {
             let mut frame = self.frozen.clone().unwrap_or_else(|| self.live_frame());
@@ -1002,10 +821,10 @@ impl Core {
                 "/{} · Enter: accept · Esc: browse · {}",
                 self.query, self.note
             ),
-            Mode::Copy => {
+            Mode::SearchResults => {
                 if self.note.is_empty() {
                     format!(
-                        "COPY (view frozen) · Esc: browse · arrows/hjkl · v select · y copy · ↓ {}",
+                        "SEARCH RESULTS · Esc: browse · n/N: next/previous · ↓ {}",
                         self.unread
                     )
                 } else {
@@ -1027,14 +846,12 @@ impl Core {
                 "Ctrl+] then b              return to latest",
                 "Ctrl+] then i / + / -      toggle / grow / shrink live input",
                 "Ctrl+] then /              search history (literal, case sensitive)",
-                "Ctrl+] then [              copy mode",
                 "Ctrl+] then p              pass next key unchanged",
                 "Ctrl+] then Ctrl+]         send literal Ctrl+]",
                 "",
-                "Copy: arrows or hjkl; v select; y copy via OSC52",
-                "Copy: / search; n / N next / previous",
-                "Copy: g / G first / last; Esc returns to frozen browsing",
-                "Click and drag to select; click footer to return to latest",
+                "Search results: / search; n / N next / previous",
+                "Search results: arrows/hjkl; Esc returns to browsing",
+                "Select in your terminal (Shift+drag); Ctrl+Shift+C to copy",
                 "",
                 "Ordinary keys still go to Codex while browsing.",
                 "Touch requires SSH client mouse reporting or PgUp/PgDown.",
@@ -1077,7 +894,6 @@ impl Core {
                 shape
             },
             status: String::new(),
-            selection: None,
         }
     }
 }
@@ -1136,7 +952,7 @@ mod tests {
         c.frame().cells.iter().map(|c| c.c).collect()
     }
     #[test]
-    fn legacy_mouse_release_restores_streaming() {
+    fn mouse_drag_never_copies_or_freezes_output() {
         let mut c = core(20);
         c.process(b"working");
         for (button, col, release) in [(0, 1, false), (32, 4, false), (3, 4, true)] {
@@ -1146,15 +962,13 @@ mod tests {
                 row: 1,
                 release,
             });
+            assert_eq!(c.mode, Mode::Follow);
+            assert_eq!(c.input_mode(), InputMode::Normal);
         }
-        assert_eq!(c.mode, Mode::Follow);
         c.process(b"\rupdated");
         assert!(text(&c).starts_with("updated"));
-        assert!(
-            String::from_utf8(c.controls())
-                .unwrap()
-                .contains(&STANDARD.encode("work"))
-        );
+        assert!(!c.controls().windows(5).any(|b| b == b"\x1b]52;"));
+        assert!(!c.frame().status.contains("Sent"));
     }
 
     #[test]
@@ -1202,11 +1016,11 @@ mod tests {
     }
 
     #[test]
-    fn resizing_live_input_exits_copy_without_losing_history() {
+    fn resizing_live_input_exits_search_without_losing_history() {
         let mut c = core(100);
         c.process(b"old history\r\n\r\ncomposer");
         c.pin_rows = 6;
-        c.action(Action::CopyMode);
+        c.action(Action::Search);
         let rows = c.document.as_ref().unwrap().rows.clone();
         assert!(c.pin_band().is_none());
         c.action(Action::PinResize(2));
@@ -1381,7 +1195,7 @@ mod tests {
         assert_eq!(c.mode, Mode::Browse);
     }
     #[test]
-    fn search_and_copy_unicode_snapshot() {
+    fn search_unicode_snapshot_never_copies() {
         let mut c = core(100);
         c.process("zero\r\n中文 target\r\nlast".as_bytes());
         c.action(Action::Search);
@@ -1394,7 +1208,16 @@ mod tests {
         c.process(b"\x1b[2Jchanged");
         c.action(Action::LocalKey(Key::Char('y')));
         let out = String::from_utf8(c.controls()).unwrap();
-        assert!(out.contains(&STANDARD.encode("中文 target")));
+        assert!(!out.contains("\x1b]52;"));
+        assert!(text(&c).contains("target"));
+        assert_eq!(
+            c.document
+                .as_ref()
+                .unwrap()
+                .find("中文 target", None, false),
+            Some((1, 0))
+        );
+        c.action(Action::LocalKey(Key::Escape));
         assert_eq!(c.input_mode(), InputMode::Normal);
         assert_eq!(c.mode, Mode::Browse);
     }
@@ -1409,7 +1232,7 @@ mod tests {
         assert_eq!(c.mode, Mode::Follow);
     }
     #[test]
-    fn selection_and_search_keep_spaces_at_soft_wraps() {
+    fn search_keeps_spaces_at_soft_wraps() {
         let mut first = vec![Cell::default(); 4];
         first[0].c = '你';
         first[1].flags.insert(Flags::WIDE_CHAR_SPACER);
@@ -1419,20 +1242,15 @@ mod tests {
         let mut second = vec![Cell::default(); 4];
         second[0].c = '好';
         second[1].c = '!';
-        let mut doc = Document {
+        let doc = Document {
             rows: vec![first, second],
             wrapped: vec![true, false],
             cols: 4,
             top: 0,
             cursor: (1, 1),
-            anchor: Some((0, 0)),
         };
-        assert_eq!(doc.text(true), "你  好!");
-        assert_eq!(doc.text(false), "你  好!");
         assert_eq!(doc.find("你  好", None, false), Some((0, 0)));
         assert_eq!(doc.find("  好!", None, false), Some((0, 2)));
-        doc.anchor = None;
-        assert_eq!(doc.text(true), "好!");
     }
 
     #[test]
@@ -1449,7 +1267,6 @@ mod tests {
             cursor: None,
             cursor_shape: 0,
             status: String::new(),
-            selection: None,
         });
         c.document();
         let doc = c.document.as_ref().unwrap();
@@ -1468,7 +1285,7 @@ mod tests {
         assert_eq!(c.input_mode(), InputMode::Normal);
         assert!(text(&c).contains("original"));
         assert!(!text(&c).contains("codex24h "));
-        c.action(Action::CopyMode);
+        c.action(Action::Search);
         let before = text(&c);
         c.action(Action::Help);
         c.action(Action::LocalKey(Key::Escape));
@@ -1476,7 +1293,7 @@ mod tests {
         assert!(c.document.is_some());
         assert_eq!(text(&c), before);
         c.process(b"\x1b[2Jchanged");
-        c.action(Action::CopyMode);
+        c.action(Action::Search);
         assert_eq!(text(&c), before);
     }
 
@@ -1501,70 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn drag_starts_copy_without_click_stealing_keys_and_freezes_press_screen() {
-        let mut c = core(20);
-        c.process(b"abcdef");
-        c.action(Action::Mouse {
-            button: 0,
-            col: 2,
-            row: 1,
-            release: false,
-        });
-        assert_eq!(c.input_mode(), InputMode::Normal);
-        c.process(b"\rXXXXXX");
-        c.action(Action::Mouse {
-            button: 32,
-            col: 5,
-            row: 1,
-            release: false,
-        });
-        c.action(Action::Mouse {
-            button: 0,
-            col: 5,
-            row: 1,
-            release: true,
-        });
-        assert_eq!(c.mode, Mode::Follow);
-        assert!(
-            String::from_utf8(c.controls())
-                .unwrap()
-                .contains(&STANDARD.encode("bcde"))
-        );
-    }
-
-    #[test]
-    fn dragging_into_footer_keeps_selection_and_copies_on_release() {
-        let mut c = core(20);
-        c.process(b"hello");
-        c.action(Action::Mouse {
-            button: 0,
-            col: 1,
-            row: 1,
-            release: false,
-        });
-        c.action(Action::Mouse {
-            button: 32,
-            col: 5,
-            row: c.size.rows as u16 + 1,
-            release: false,
-        });
-        assert_eq!(c.mode, Mode::Copy);
-        c.action(Action::Mouse {
-            button: 0,
-            col: 5,
-            row: c.size.rows as u16 + 1,
-            release: true,
-        });
-        assert_eq!(c.mode, Mode::Follow);
-        assert!(
-            String::from_utf8(c.controls())
-                .unwrap()
-                .contains("\x1b]52;c;")
-        );
-    }
-
-    #[test]
-    fn drag_in_pinned_history_works_even_when_child_tracks_mouse() {
+    fn drag_in_pinned_history_is_ignored_even_when_child_tracks_mouse() {
         let mut c = core(50);
         c.pin_rows = 6;
         c.process(b"history text\x1b[?1002h\x1b[?1006h");
@@ -1592,39 +1346,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_copy_mode_preserves_keyboard_selection() {
-        let mut c = core(20);
-        c.process(b"abcdef");
-        c.action(Action::CopyMode);
-        c.action(Action::Mouse {
-            button: 0,
-            col: 2,
-            row: 1,
-            release: false,
-        });
-        c.action(Action::Mouse {
-            button: 32,
-            col: 5,
-            row: 1,
-            release: false,
-        });
-        c.action(Action::Mouse {
-            button: 0,
-            col: 5,
-            row: 1,
-            release: true,
-        });
-        assert_eq!(c.mode, Mode::Copy);
-        assert_eq!(c.document.as_ref().unwrap().text(true), "bcde");
-        c.action(Action::LocalKey(Key::Char('y')));
-        assert!(
-            String::from_utf8(c.controls())
-                .unwrap()
-                .contains(&STANDARD.encode("bcde"))
-        );
-    }
-
-    #[test]
     fn browse_keeps_full_document_until_scrolling_to_bottom() {
         let mut c = core(40);
         for i in 0..20 {
@@ -1633,10 +1354,10 @@ mod tests {
         c.action(Action::Search);
         c.action(Action::LocalKey(Key::Escape));
         assert_eq!(c.mode, Mode::Browse);
-        let original = c.document.as_ref().unwrap().text(false);
+        let original = c.document.as_ref().unwrap().rows.clone();
         c.process(b"\x1b[2Jreplacement\r\n");
-        c.action(Action::CopyMode);
-        assert_eq!(c.document.as_ref().unwrap().text(false), original);
+        c.action(Action::Search);
+        assert_eq!(c.document.as_ref().unwrap().rows.clone(), original);
         c.action(Action::LocalKey(Key::Escape));
         assert_eq!(c.mode, Mode::Browse);
         c.action(Action::PageDown);

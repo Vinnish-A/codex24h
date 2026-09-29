@@ -19,7 +19,6 @@ pub enum Action {
     Bottom,
     PinToggle,
     PinResize(i32),
-    CopyMode,
     Search,
     Help,
     QuitBrowse,
@@ -265,7 +264,6 @@ impl Router {
                     Some('+') | Some('=') => out.push(Action::PinResize(2)),
                     Some('-') => out.push(Action::PinResize(-2)),
                     Some('/') => out.push(Action::Search),
-                    Some('[') => out.push(Action::CopyMode),
                     Some('?') => out.push(Action::Help),
                     Some('p') => self.pass_next = true,
                     Some('\x1d') => forward(&mut out, &token),
@@ -779,12 +777,11 @@ mod tests {
     fn shortcuts_and_passthrough_are_distinct() {
         let mut router = Router::new();
         assert_eq!(
-            router.feed(b"a\x1db\x1d/\x1d[\x1d?"),
+            router.feed(b"a\x1db\x1d/\x1d?"),
             vec![
                 Action::Forward(b"a".to_vec()),
                 Action::Bottom,
                 Action::Search,
-                Action::CopyMode,
                 Action::Help
             ]
         );
@@ -959,10 +956,10 @@ mod tests {
     fn step_parser_applies_mode_change_inside_one_read() {
         let mut router = Router::new();
         assert_eq!(
-            router.feed_step(b"a\x1d[\x1b[97u"),
+            router.feed_step(b"a\x1d/\x1b[97u"),
             vec![Action::Forward(b"a".to_vec())]
         );
-        assert_eq!(router.drain_step(), vec![Action::CopyMode]);
+        assert_eq!(router.drain_step(), vec![Action::Search]);
         router.set_mode(InputMode::Local);
         assert_eq!(router.drain_step(), vec![Action::LocalKey(Key::Char('a'))]);
         assert!(router.drain_step().is_empty());

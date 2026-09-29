@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Local tmux attach integration. --native also sends one real Codex task."""
 import os
-import base64
 from pathlib import Path
 import shlex
 import signal
@@ -107,16 +106,15 @@ class AttachTest(unittest.TestCase):
             os.kill(self.pid, 0)
         print(f'\n  Eight attaches: {min(elapsed):.2f}–{max(elapsed):.2f}s to visible target', flush=True)
 
-    def test_search_copy_and_paste_remain_separate_from_native_input(self):
+    def test_search_and_paste_remain_separate_from_native_input(self):
         terminal = self.attach()
         self.ready(terminal)
         before = self.log('stdin.bin')
         terminal.send(b'\x1d/ROW-070\r')
-        self.wait(lambda: 'COPY' in self.body(terminal)[-1], terminal)
-        terminal.send(b'vlllllly')
-        copied = b'ROW-070'
-        self.wait(lambda: b'\x1b]52;c;'+base64.b64encode(copied) in terminal.output, terminal)
-        self.assertIn(b'\x1b]52;c;'+base64.b64encode(copied), terminal.output)
+        self.wait(lambda: 'SEARCH RESULTS' in self.body(terminal)[-1], terminal)
+        terminal.send(b'nN')
+        terminal.drain(.2)
+        self.assertNotIn(b'\x1b]52;', terminal.output)
         self.assertEqual(self.log('stdin.bin'), before)
         terminal.send(b'\x1db')
         paste = b'\x1b[200~'+ '中文🙂\n'.encode()+b'\x1dd\x1b[201~'
