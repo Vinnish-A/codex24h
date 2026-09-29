@@ -53,6 +53,12 @@ codex24h attach <PID>
 
 按 Ctrl+] 然后 d 断开，原任务继续运行。这是实验功能，需要 tmux、Python 3 和 `tic`；暂不支持直接启动在普通终端里的进程，也不会补齐接入前的历史。详见[接入说明](docs/attach.md)。
 
+## 图片粘贴
+
+通过 SSH 使用时，建议选择 [Tabby](https://tabby.sh)，并安装 [tabby-ssh-image-paste](https://github.com/Vinnish-A/tabby-ssh-image-paste)。Windows 上复制截图后，在远程 Codex 输入框按 `Ctrl+Shift+V`，插件会通过当前连接的 SFTP 上传图片并填入路径，供 Codex 识别为附件。
+
+服务器需支持 SFTP，且 `/tmp` 可写；无需额外登录或服务端插件。插件尚未上架商店，按其 [安装说明](https://github.com/Vinnish-A/tabby-ssh-image-paste#安装到-windows-tabby) 下载并放入 Tabby 插件目录即可。
+
 ## 邮件通知
 
 可在每轮回答完成后自动发送邮件，附上会话名和恢复命令。Goal 完成时会特别标注。由本机程序触发，不需要 agent 介入。
