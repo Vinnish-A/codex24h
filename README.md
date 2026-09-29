@@ -58,7 +58,7 @@ codex24h attach <PID>
 
 通过 SSH 使用时，建议选择 [Tabby](https://tabby.sh)，并安装 [tabby-ssh-image-paste](https://github.com/Vinnish-A/tabby-ssh-image-paste)。Windows 上复制截图后，在远程 Codex 输入框按 `Ctrl+V` 或 `Ctrl+Shift+V`，插件会通过当前连接的 SFTP 上传图片并填入路径，供 Codex 识别为附件。
 
-服务器需支持 SFTP，且 `/tmp` 可写；无需额外登录或服务端插件。插件尚未上架商店，按其 [安装说明](https://github.com/Vinnish-A/tabby-ssh-image-paste#安装到-windows-tabby) 下载 ZIP，解压后双击 `install.cmd`，再重启 Tabby。插件默认自动检查 GitHub 更新，可在设置中关闭。
+服务器需支持 SFTP，且 `/tmp` 可写；无需额外登录或服务端插件。插件尚未上架商店，按其 [安装说明](https://github.com/Vinnish-A/tabby-ssh-image-paste#安装到-windows-tabby) 下载并双击 `install.cmd`，再重启 Tabby。后续更新双击同一个脚本即可；插件不在后台自动更新。支持整段文字与多张图片按顺序粘贴。
 
 ## 邮件通知
 

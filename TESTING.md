@@ -192,3 +192,12 @@ Windows Tabby **1.0.237**，安装 npm 发布的 `tabby-ssh-image-clipboard` **0
 - 插件 0.1.3：Windows 双击安装器已实际运行、重复安装成功，文件与目录联接均验证；升级保留其他插件并备份旧文件。更新测试覆盖校验失败、下载失败、成功替换、禁止降级及临时文件清理。
 
 - 插件 0.1.4 改用 Chromium 网络栈，修复本机 Node HTTPS 的域名解析失败。独立真实 Windows Tabby 窗口的启动检查成功下载安装 GitHub 当时缓存的 0.1.3；随后以 v0.1.4 tag 清单调用同一更新函数，实际替换 JS / LICENSE / package.json，三份 SHA-256 均与发布清单一致。未重启用户工作窗口。
+
+### 2026-09-29：整段图文与手动更新
+
+- Windows Tabby 原生 SSH → codex24h → Codex 0.158.0：剪贴板仅提供 HTML 与文字，没有原生位图；一次 Ctrl+Shift+V 按顺序显示 before-one、Image #1、between-two、Image #2、after-three。图片分别来自内嵌 PNG 和本地 file URL，使用真实 SFTP 上传，未向模型发送测试任务。
+- 真实 Electron DOM / 图片解码测试覆盖 HTML 顺序、段落、选区 fragment、忽略脚本、Word 的 v:imagedata、本地/内嵌图片及公开 HTTPS 图片读取。粘贴服务测试覆盖多图顺序、剪贴板快照、唯一文件名和第二张图失败时不插入部分内容。
+- 插件 0.1.5 删除启动自动更新；独立 install.cmd 的 Windows 实测覆盖脚本位于含空格路径、GitHub 下载、解压与安装。后续升级仍由用户双击同一脚本触发。
+
+- Ctrl+] + 修复：52 项 Rust 单元测试通过；真实 Tabby 键盘事件先进入 COPY，再发送 Ctrl+]、Shift+=，成功回到浏览并显示 Live input max: 8 rows，保留历史。
+- 固定 install.cmd 在本机实际从 GitHub 下载 v0.1.5，先升级独立测试配置，再安装到用户插件目录；无后台自动更新代码。

@@ -733,6 +733,10 @@ mod tests {
                 Action::PinResize(-2)
             ]
         );
+        assert_eq!(
+            r.feed(b"\x1b[93;5u\x1b[61:43;2u"),
+            vec![Action::PinResize(2)]
+        );
         assert_eq!(r.feed(b"i+-"), vec![Action::Forward(b"i+-".to_vec())]);
     }
 

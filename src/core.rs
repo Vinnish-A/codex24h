@@ -554,9 +554,35 @@ impl Core {
             Action::PageUp => self.scroll(self.browse_rows().saturating_sub(1).max(1) as i32),
             Action::PageDown => self.scroll(-(self.browse_rows().saturating_sub(1).max(1) as i32)),
             Action::Bottom => self.bottom(),
-            Action::PinToggle => self.pin_rows = if self.pin_rows == 0 { 6 } else { 0 },
-            Action::PinResize(delta) => {
-                self.pin_rows = (self.pin_rows as i32 + delta).clamp(0, 100) as usize
+            Action::PinToggle | Action::PinResize(_) => {
+                self.pin_rows = match action {
+                    Action::PinToggle => {
+                        if self.pin_rows == 0 {
+                            6
+                        } else {
+                            0
+                        }
+                    }
+                    Action::PinResize(delta) => {
+                        (self.pin_rows as i32 + delta).clamp(0, 100) as usize
+                    }
+                    _ => unreachable!(),
+                };
+                if matches!(self.mode, Mode::Copy | Mode::Search | Mode::Help) {
+                    self.leave_local();
+                    if let Some(doc) = &mut self.document {
+                        doc.anchor = None;
+                    }
+                }
+                self.note = format!(
+                    "Live input max: {} rows{}",
+                    self.pin_rows,
+                    if self.mode == Mode::Follow {
+                        " (scroll up to view)"
+                    } else {
+                        ""
+                    }
+                );
             }
             Action::CopyMode => {
                 self.document();
@@ -982,6 +1008,9 @@ impl Core {
             }
             Mode::Help => "HELP · Esc: browse · Ctrl+] b: live".into(),
         };
+        if matches!(self.mode, Mode::Follow | Mode::Browse) && !self.note.is_empty() {
+            frame.status = format!("{} · {}", self.note, frame.status);
+        }
         if self.mode == Mode::Help {
             frame.cells.fill(Cell::default());
             frame.cursor = None;
@@ -1101,6 +1130,24 @@ mod tests {
     fn text(c: &Core) -> String {
         c.frame().cells.iter().map(|c| c.c).collect()
     }
+    #[test]
+    fn resizing_live_input_exits_copy_without_losing_history() {
+        let mut c = core(100);
+        c.process(b"old history\r\n\r\ncomposer");
+        c.pin_rows = 6;
+        c.action(Action::CopyMode);
+        let rows = c.document.as_ref().unwrap().rows.clone();
+        assert!(c.pin_band().is_none());
+        c.action(Action::PinResize(2));
+        assert_eq!(c.mode, Mode::Browse);
+        assert_eq!(c.pin_rows, 8);
+        assert!(c.pin_band().is_some());
+        assert_eq!(c.document.as_ref().unwrap().rows, rows);
+        assert!(c.frame().status.starts_with("Live input max: 8 rows"));
+        c.action(Action::Forward(b"x".to_vec()));
+        assert_eq!(c.pty_out, b"x");
+    }
+
     #[test]
     fn pinned_input_updates_without_moving_history_or_stealing_keys() {
         let mut c = core(100);
