@@ -94,7 +94,7 @@ Wrapper 选项通过环境变量设置，避免与 Codex 参数重名。
 
 本机 Xshell 8.0.0110 已实测：图片剪贴板的 Ctrl+Shift+V / Shift+Insert，以及复制 PNG 文件后的 Ctrl+Shift+V，均未向 SSH 接收端插入图片路径；前后文字粘贴对照正常。这些默认粘贴方式不满足自动图片上传要求。详细过程见 [TESTING.md](../TESTING.md)。
 
-Windows Tabby 1.0.237 + [SSH Image Paste 插件](https://github.com/Vinnish-A/tabby-ssh-image-paste)已验证原生 SSH 图片上传。插件 0.1.3 支持 Ctrl+V / Ctrl+Shift+V，并用 bracketed paste 将图片路径送进 Codex；上传失败显示错误。下载插件 ZIP、完整解压后双击 install.cmd 安装，再完全退出并重新打开 Tabby。默认启动时自动检查 GitHub 更新，可在插件设置中关闭。请使用“配置和连接”中的原生 SSH 连接；在 PowerShell 里运行 ssh 不提供插件所需的 SFTP 会话。
+Windows Tabby 1.0.237 + [SSH Image Paste 插件](https://github.com/Vinnish-A/tabby-ssh-image-paste)已验证原生 SSH 图片上传。插件 0.1.4 支持 Ctrl+V / Ctrl+Shift+V，并用 bracketed paste 将图片路径送进 Codex；上传失败显示错误。下载插件 ZIP、完整解压后双击 install.cmd 安装，再完全退出并重新打开 Tabby。默认启动时自动检查 GitHub 更新，可在插件设置中关闭。请使用“配置和连接”中的原生 SSH 连接；在 PowerShell 里运行 ssh 不提供插件所需的 SFTP 会话。
 
 ### 终端实现
 
