@@ -240,6 +240,31 @@ class WrapperE2E(unittest.TestCase):
             time.sleep(0.02)
         self.assertIsNone(process_state(pid), f"child PID {pid} survived wrapper exit")
 
+    def test_streaming_survives_drag_release_and_lost_mouseup(self):
+        terminal = Terminal(self.env)
+        self.addCleanup(terminal.close)
+        terminal.until('READY-080')
+        terminal.send(b':heartbeat 100\n')
+        self.wait_log('events.log', b'beat:1\n')
+        def beat():
+            terminal.drain(.2)
+            lines = screen_text(terminal.output)
+            match = re.search(r'WORK-(\d+)', '\n'.join(lines))
+            return int(match[1]) if match else 0
+        for _ in range(4):
+            terminal.send(b'\x1b[<0;1;1M\x1b[<32;5;1M\x1b[<0;5;1m')
+            before = beat()
+            self.assertGreater(beat(), before, 'timer must continue after mouse-up without Ctrl+C')
+        terminal.send(b'\x1b[<0;1;1M\x1b[<32;5;1M')
+        terminal.send(b'\x1b[A\t')  # release outside the client: next key still reaches Codex
+        self.wait_log('stdin.bin', b'\x1b[A\t')
+        before = beat()
+        self.assertGreater(beat(), before)
+        terminal.send(b'\x03')
+        self.wait_log('stdin.bin', b'\x03')
+        terminal.send(b':exit 0\n')
+        self.assertEqual(terminal.wait_draining(), 0)
+
     def test_transient_tiny_resize_preserves_running_child(self):
         terminal = Terminal(self.env)
         self.addCleanup(terminal.close)

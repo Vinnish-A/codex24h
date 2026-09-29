@@ -88,16 +88,6 @@ fn run() -> Result<i32> {
     let history = number("CODEX24H_HISTORY", 10_000, 1, 1_000_000)?;
     let pin_rows = number("CODEX24H_PIN_ROWS", 6, 0, 100)?;
     let escape_ms = number("CODEX24H_ESCAPE_MS", 100, 10, 2000)?;
-    let export_dir = env::var_os("CODEX24H_EXPORT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            env::var_os("XDG_CACHE_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".cache")
-                })
-                .join("codex24h")
-        });
     let mut outer = terminal::Terminal::raw()?;
     let caps = outer.discover()?;
     let size = terminal::size()?;
@@ -116,14 +106,7 @@ fn run() -> Result<i32> {
     let mut final_screen = None;
     let result = (|| -> Result<i32> {
         outer.enter(caps.kitty)?;
-        let mut core = Core::new(
-            size,
-            history,
-            caps.kitty,
-            caps.foreground,
-            caps.background,
-            export_dir,
-        );
+        let mut core = Core::new(size, history, caps.kitty, caps.foreground, caps.background);
         core.pin_rows = pin_rows;
         let mut router = Router::new();
         router.set_detachable(attached);

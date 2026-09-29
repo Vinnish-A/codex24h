@@ -20,7 +20,7 @@ def main():
         attach = '--attach' in sys.argv
         executable = ['codex', '--no-alt-screen', '-c', 'notify=[]'] if attach else [str(e2e.BIN)]
         cmd = ['env', 'CODEX24H_MAIL=0', 'CODEX24H_PIN_ROWS=6',
-               f'CODEX24H_EXPORT_DIR={base}', *executable]
+               *executable]
         pane, pid = tmux('-f', '/dev/null', 'new-session', '-d', '-s', 'probe', '-x', '100', '-y', '32',
                          '-c', str(e2e.ROOT), '-P', '-F', '#{pane_id} #{pane_pid}', shlex.join(cmd)).split()
         def screen():
@@ -43,7 +43,7 @@ def main():
             time.sleep(15)
             if attach:
                 client = ['env', 'CODEX24H_MAIL=0', 'CODEX24H_PIN_ROWS=6',
-                          f'CODEX24H_EXPORT_DIR={base}', str(e2e.BIN), 'attach', '--socket', socket, pid]
+                          str(e2e.BIN), 'attach', '--socket', socket, pid]
                 pane, supervisor = tmux('new-window', '-d', '-t', 'probe', '-P', '-F', '#{pane_id} #{pane_pid}', shlex.join(client)).split()
                 wait(lambda text: 'Ask Codex' in text)
                 children = Path(f'/proc/{supervisor}/task/{supervisor}/children').read_text().split()

@@ -17,7 +17,6 @@ use alacritty_terminal::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{
     cell::RefCell,
-    path::PathBuf,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -102,7 +101,7 @@ impl Document {
             let hi = if row == end.0 { end.1 } else { self.cols - 1 };
             let mut chars = self.row_chars(row, lo, hi);
             // A soft wrap is part of the same logical line. Its spaces are
-            // content; trimming them would join words on copy and export.
+            // content; trimming them would join words on copy.
             if row == end.0 || !self.wrapped[row] {
                 while chars.last().is_some_and(|(ch, _)| *ch == ' ') {
                     chars.pop();
@@ -177,6 +176,7 @@ pub struct Core {
     pub query: String,
     note: String,
     mouse_press: Option<(u16, u16, Frame)>,
+    drag_return: Option<Mode>,
     history_limit: usize,
     foreground: Rgb,
     background: Rgb,
@@ -186,18 +186,10 @@ pub struct Core {
         Instant,
         std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>,
     )>,
-    pub export_dir: PathBuf,
 }
 
 impl Core {
-    pub fn new(
-        size: Size,
-        history: usize,
-        kitty: bool,
-        foreground: Rgb,
-        background: Rgb,
-        export_dir: PathBuf,
-    ) -> Self {
+    pub fn new(size: Size, history: usize, kitty: bool, foreground: Rgb, background: Rgb) -> Self {
         let events = Events(Rc::new(RefCell::new(Vec::new())));
         let term = Term::new(
             Config {
@@ -228,17 +220,18 @@ impl Core {
             query: String::new(),
             note: String::new(),
             mouse_press: None,
+            drag_return: None,
             history_limit: history,
             foreground,
             background,
             outer_kitty: kitty,
             last_modes: None,
             clipboard_pending: None,
-            export_dir,
         }
     }
     pub fn input_mode(&self) -> InputMode {
-        if matches!(self.mode, Mode::Copy | Mode::Search | Mode::Help) {
+        if self.drag_return.is_none() && matches!(self.mode, Mode::Copy | Mode::Search | Mode::Help)
+        {
             InputMode::Local
         } else {
             InputMode::Normal
@@ -460,6 +453,7 @@ impl Core {
         self.frozen = None;
         self.document = None;
         self.unread = 0;
+        self.drag_return = None;
         self.note.clear();
         self.dirty = true;
     }
@@ -531,8 +525,11 @@ impl Core {
     }
     pub fn action(&mut self, action: Action) {
         self.dirty = true;
-        if !matches!(&action, Action::Mouse { .. }) {
+        if !matches!(&action, Action::Mouse { .. } | Action::TerminalReply(_)) {
             self.mouse_press = None;
+            // Mouse-up may be lost when releasing outside the terminal. A key
+            // cancels this temporary selection and keeps its native meaning.
+            self.finish_drag();
         }
         match action {
             Action::Forward(bytes) => self.pty_out.extend(bytes),
@@ -604,11 +601,23 @@ impl Core {
             Action::QuitBrowse => self.bottom(),
             Action::LocalKey(key) => self.local_key(key),
             Action::Mouse {
-                button,
+                mut button,
                 col,
                 mut row,
-                release,
+                mut release,
             } => {
+                // X10 reports mouse-up as button 3, rather than naming the
+                // released button. Also recover a no-buttons motion event.
+                if button & 3 == 3 && button & 64 == 0 && self.drag_return.is_some() {
+                    button &= !35;
+                    release = true;
+                }
+                // Right-click belongs to the SSH client's menu/paste behavior.
+                if button & 0x43 == 2 {
+                    self.finish_drag();
+                    self.mouse_press = None;
+                    return;
+                }
                 if row as usize > self.size.rows {
                     if button & 3 == 0 && (self.mode == Mode::Copy || self.mouse_press.is_some()) {
                         row = self.size.rows as u16;
@@ -656,6 +665,7 @@ impl Core {
                             doc.top + start_row.saturating_sub(1) as usize,
                             (start_col.saturating_sub(1) as usize).min(doc.cols - 1),
                         ));
+                        self.drag_return = Some(self.mode);
                         self.mode = Mode::Copy;
                         self.note.clear();
                     }
@@ -705,12 +715,28 @@ impl Core {
                     doc.cursor = point;
                     if release && doc.anchor.is_some() {
                         let text = doc.text(true);
-                        self.clipboard(&text);
-                        self.note = format!(
-                            "Copied {} bytes via OSC52 · Esc: browse · e: export",
-                            text.len()
-                        );
+                        if !text.trim().is_empty() {
+                            self.clipboard(&text);
+                        }
+                        self.finish_drag();
+                        self.note = if text.trim().is_empty() {
+                            "Empty selection; clipboard unchanged".into()
+                        } else {
+                            format!("Sent {} bytes to client clipboard (OSC52)", text.len())
+                        };
                     }
+                }
+            }
+        }
+    }
+    fn finish_drag(&mut self) {
+        if let Some(mode) = self.drag_return.take() {
+            if mode == Mode::Follow {
+                self.bottom();
+            } else {
+                self.mode = mode;
+                if let Some(doc) = &mut self.document {
+                    doc.anchor = None;
                 }
             }
         }
@@ -776,12 +802,21 @@ impl Core {
             }
             Key::Char('y') | Key::Enter => {
                 let text = self.document.as_ref().unwrap().text(true);
-                self.clipboard(&text);
-                self.note = format!("Copied {} bytes via OSC52 · e export", text.len());
-                return;
-            }
-            Key::Char('e') => {
-                self.export();
+                if !text.trim().is_empty() {
+                    self.clipboard(&text);
+                }
+                self.leave_local();
+                if let Some(doc) = &mut self.document {
+                    doc.anchor = None;
+                }
+                self.note = if text.trim().is_empty() {
+                    "Empty selection; clipboard unchanged".into()
+                } else {
+                    format!(
+                        "Sent {} bytes to client clipboard (OSC52) · Esc: browse",
+                        text.len()
+                    )
+                };
                 return;
             }
             _ => {}
@@ -842,35 +877,6 @@ impl Core {
     fn clipboard(&mut self, text: &str) {
         self.control
             .extend_from_slice(format!("\x1b]52;c;{}\x1b\\", STANDARD.encode(text)).as_bytes());
-    }
-    fn export(&mut self) {
-        use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt, time::SystemTime};
-        let text = self
-            .document
-            .as_ref()
-            .unwrap()
-            .text(self.document.as_ref().unwrap().anchor.is_some());
-        let path = self.export_dir.join(format!(
-            "copy-{}-{}.txt",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let result = std::fs::create_dir_all(&self.export_dir)
-            .and_then(|_| {
-                OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&path)
-            })
-            .and_then(|mut f| f.write_all(text.as_bytes()));
-        self.note = match result {
-            Ok(()) => format!("Saved {}", path.display()),
-            Err(e) => format!("Export failed: {e}"),
-        };
     }
     pub fn controls(&mut self) -> Vec<u8> {
         let mut out = std::mem::take(&mut self.control);
@@ -984,7 +990,7 @@ impl Core {
         frame.status = match self.mode {
             Mode::Follow => "codex24h · PgUp / wheel: history · Ctrl+] ?: help".into(),
             Mode::Browse => format!(
-                "↓ {} new updates · PgDn: latest · Ctrl+] b: bottom · /: search via Ctrl+]{}",
+                "HISTORY (frozen) · ↓ {} new updates · PgDn: latest · Ctrl+] b: bottom · /: search via Ctrl+]{}",
                 self.unread,
                 if self.term.history_size() >= self.history_limit {
                     " · history limit"
@@ -999,7 +1005,7 @@ impl Core {
             Mode::Copy => {
                 if self.note.is_empty() {
                     format!(
-                        "COPY · arrows/hjkl · v select · y copy · / search · n/N next · e export · ↓ {}",
+                        "COPY (view frozen) · Esc: browse · arrows/hjkl · v select · y copy · ↓ {}",
                         self.unread
                     )
                 } else {
@@ -1026,7 +1032,7 @@ impl Core {
                 "Ctrl+] then Ctrl+]         send literal Ctrl+]",
                 "",
                 "Copy: arrows or hjkl; v select; y copy via OSC52",
-                "Copy: / search; n / N next / previous; e export text",
+                "Copy: / search; n / N next / previous",
                 "Copy: g / G first / last; Esc returns to frozen browsing",
                 "Click and drag to select; click footer to return to latest",
                 "",
@@ -1124,12 +1130,77 @@ mod tests {
                 b: 220,
             },
             Rgb { r: 0, g: 0, b: 0 },
-            PathBuf::from("/tmp"),
         )
     }
     fn text(c: &Core) -> String {
         c.frame().cells.iter().map(|c| c.c).collect()
     }
+    #[test]
+    fn legacy_mouse_release_restores_streaming() {
+        let mut c = core(20);
+        c.process(b"working");
+        for (button, col, release) in [(0, 1, false), (32, 4, false), (3, 4, true)] {
+            c.action(Action::Mouse {
+                button,
+                col,
+                row: 1,
+                release,
+            });
+        }
+        assert_eq!(c.mode, Mode::Follow);
+        c.process(b"\rupdated");
+        assert!(text(&c).starts_with("updated"));
+        assert!(
+            String::from_utf8(c.controls())
+                .unwrap()
+                .contains(&STANDARD.encode("work"))
+        );
+    }
+
+    #[test]
+    fn empty_mouse_selection_preserves_clipboard_and_lost_release_keeps_native_keys() {
+        let mut c = core(20);
+        for (button, col, release) in [(0, 1, false), (32, 4, false), (0, 4, true)] {
+            c.action(Action::Mouse {
+                button,
+                col,
+                row: 1,
+                release,
+            });
+        }
+        assert_eq!(c.mode, Mode::Follow);
+        assert!(
+            !String::from_utf8(c.controls())
+                .unwrap()
+                .contains("\x1b]52;c;")
+        );
+        c.process(b"working");
+        for (button, col) in [(0, 1), (32, 4)] {
+            c.action(Action::Mouse {
+                button,
+                col,
+                row: 1,
+                release: false,
+            });
+        }
+        assert_eq!(c.input_mode(), InputMode::Normal);
+        c.process(b"\rupdated");
+        c.action(Action::Forward(b"\x03".to_vec()));
+        assert_eq!(c.mode, Mode::Follow);
+        assert_eq!(c.pty_out, b"\x03");
+        assert!(text(&c).starts_with("updated"));
+        c.process(b"\x1b[?1000h\x1b[?1006h");
+        c.pty_out.clear();
+        c.action(Action::Mouse {
+            button: 2,
+            col: 2,
+            row: 1,
+            release: false,
+        });
+        assert!(c.pty_out.is_empty());
+        assert_eq!(c.mode, Mode::Follow);
+    }
+
     #[test]
     fn resizing_live_input_exits_copy_without_losing_history() {
         let mut c = core(100);
@@ -1324,6 +1395,8 @@ mod tests {
         c.action(Action::LocalKey(Key::Char('y')));
         let out = String::from_utf8(c.controls()).unwrap();
         assert!(out.contains(&STANDARD.encode("中文 target")));
+        assert_eq!(c.input_mode(), InputMode::Normal);
+        assert_eq!(c.mode, Mode::Browse);
     }
     #[test]
     fn ordinary_keys_do_not_unfreeze() {
@@ -1451,8 +1524,7 @@ mod tests {
             row: 1,
             release: true,
         });
-        assert_eq!(c.mode, Mode::Copy);
-        assert_eq!(c.document.as_ref().unwrap().text(true), "bcde");
+        assert_eq!(c.mode, Mode::Follow);
         assert!(
             String::from_utf8(c.controls())
                 .unwrap()
@@ -1483,7 +1555,7 @@ mod tests {
             row: c.size.rows as u16 + 1,
             release: true,
         });
-        assert_eq!(c.mode, Mode::Copy);
+        assert_eq!(c.mode, Mode::Follow);
         assert!(
             String::from_utf8(c.controls())
                 .unwrap()
@@ -1515,23 +1587,13 @@ mod tests {
             row: 1,
             release: true,
         });
-        assert_eq!(c.mode, Mode::Copy);
-        assert_eq!(c.document.as_ref().unwrap().text(true), "history");
+        assert_eq!(c.mode, Mode::Browse);
         assert!(c.pty_out.is_empty());
     }
 
     #[test]
-    fn mouse_drag_copies_selected_text_and_export_uses_selection() {
-        let export_dir = std::env::temp_dir().join(format!(
-            "codex24h-core-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    fn explicit_copy_mode_preserves_keyboard_selection() {
         let mut c = core(20);
-        c.export_dir = export_dir.clone();
         c.process(b"abcdef");
         c.action(Action::CopyMode);
         c.action(Action::Mouse {
@@ -1560,11 +1622,6 @@ mod tests {
                 .unwrap()
                 .contains(&STANDARD.encode("bcde"))
         );
-        c.action(Action::LocalKey(Key::Char('e')));
-        let path = std::path::PathBuf::from(c.note.strip_prefix("Saved ").unwrap());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "bcde");
-        std::fs::remove_file(path).unwrap();
-        std::fs::remove_dir(export_dir).unwrap();
     }
 
     #[test]

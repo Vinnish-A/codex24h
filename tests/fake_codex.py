@@ -11,6 +11,7 @@ import struct
 import sys
 import termios
 import tty
+import time
 
 
 def write_log(name, data):
@@ -117,8 +118,17 @@ def interactive():
     question = None
     question_pending = bytearray()
     question_cursor = 0
+    heartbeat = 0
+    beat = 0
+    next_beat = 0.0
     while True:
         ready, _, _ = select.select([sys.stdin.fileno()], [], [], 0.1)
+        if heartbeat and time.monotonic() >= next_beat:
+            beat += 1
+            heartbeat -= 1
+            emit(f"\x1b[1;1HWORK-{beat:04d}".encode())
+            write_log("events.log", f"beat:{beat}\n".encode())
+            next_beat = time.monotonic() + 0.05
         if not ready:
             if question is not None and question_pending == b"\x1b":
                 question_input(question_pending, question, timeout=True)
@@ -129,12 +139,14 @@ def interactive():
             return 0
         write_log("stdin.bin", data)
         all_input.extend(data)
-        for match in re.finditer(rb":(burst|repaint|clear|exit|signal|flood|question|alternate)[ \t]*(\d*)[\r\n]", all_input):
+        for match in re.finditer(rb":(burst|repaint|clear|exit|signal|flood|question|alternate|heartbeat)[ \t]*(\d*)[\r\n]", all_input):
             if match.end() <= processed:
                 continue
             processed = match.end()
             command, count = match.group(1), match.group(2)
-            if command == b"burst":
+            if command == b"heartbeat":
+                heartbeat = int(count or b"100")
+            elif command == b"burst":
                 n = int(count or b"1")
                 emit(b"".join(f"NEW-{i:03d}\r\n".encode() for i in range(1, n + 1)))
                 write_log("events.log", f"burst:{n}\n".encode())
