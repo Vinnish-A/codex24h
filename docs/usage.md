@@ -6,12 +6,10 @@
 
 ## 安装与使用
 
-已安装 Rust 和 Codex 的 Linux / WSL 环境：
+已安装 Rust、Python 3、curl 和 Codex 的 Linux / WSL 环境，安装和更新使用同一条命令：
 
 ```bash
-git clone https://github.com/Vinnish-A/codex24h.git
-cd codex24h
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/Vinnish-A/codex24h/main/install.sh | bash
 codex24h
 codex24h resume
 codex24h resume --last
@@ -19,6 +17,8 @@ codex24h resume SESSION_ID
 codex24h -C /path/to/project
 codex24h exec --json "your prompt"
 ```
+
+下载源码和构建产物会在安装结束、失败或中断后清理；保留 Cargo 共用依赖缓存。已有源码目录仍可运行 `./install.sh` 安装本地版本。
 
 安装位置默认 `~/.local/bin/codex24h`，入口统一为 `codex24h`。可用 `CODEX24H_BIN_DIR` 选择安装目录。原来的 `codex` 命令保持不变。
 

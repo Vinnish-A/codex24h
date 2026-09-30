@@ -10,17 +10,15 @@ Codex CLI 的轻量终端包装器，提供稳定的滚动和历史浏览。上�
 
 <br clear="right" />
 
-## 安装
+## 安装 / 更新
 
-支持 Linux / WSL，需要已安装 Rust、Python 3 和 Codex。
+支持 Linux / WSL，需要已安装 Rust、Python 3、curl 和 Codex。安装和更新使用同一条命令：
 
 ```bash
-git clone https://github.com/Vinnish-A/codex24h.git
-cd codex24h
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/Vinnish-A/codex24h/main/install.sh | bash
 ```
 
-默认安装到 `~/.local/bin/codex24h`。
+默认安装到 `~/.local/bin`。下载和编译在临时目录完成，结束后自动清理；保留 Cargo 共用的依赖缓存。
 
 ## 使用
 
