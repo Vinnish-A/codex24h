@@ -117,7 +117,7 @@ class Terminal:
         end = time.monotonic() + seconds
         received = bytearray()
         while time.monotonic() < end:
-            ready, _, _ = select.select([self.master], [], [], min(0.03, end - time.monotonic()))
+            ready, _, _ = select.select([self.master], [], [], max(0, min(0.03, end - time.monotonic())))
             if not ready:
                 continue
             try:
@@ -361,8 +361,12 @@ class WrapperE2E(unittest.TestCase):
         self.assertNotIn("AFTER-CLEAR", visible(frozen))
 
         latest = len(terminal.output)
-        terminal.send(b"\x1d" + b"b")  # Ctrl-] b: bottom / follow.
+        before_cancel = self.log("stdin.bin")
+        terminal.send(b"\x03")  # First Ctrl+C leaves history, preserving the task.
         terminal.until("AFTER-CLEAR", since=latest)
+        self.assertEqual(self.log("stdin.bin"), before_cancel)
+        terminal.send(b"\x03")  # Once live, Ctrl+C is native application input again.
+        self.wait_log("stdin.bin", before_cancel + b"\x03")
 
         terminal.resize(31, 92)
         self.wait_log("size.log", b"30x92")  # Last outer row belongs to wrapper status.

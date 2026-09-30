@@ -20,6 +20,7 @@ pub enum Action {
     PinToggle,
     PinResize(i32),
     Search,
+    Requests,
     Help,
     QuitBrowse,
     Mouse {
@@ -51,6 +52,7 @@ pub enum Key {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
+    Browse,
     Local,
 }
 
@@ -163,7 +165,7 @@ impl Router {
                 if pending[at..].starts_with(PASTE_END) {
                     at += PASTE_END.len();
                     self.paste = false;
-                    if self.mode == InputMode::Normal {
+                    if self.mode != InputMode::Local {
                         forward(&mut out, PASTE_END);
                     } else {
                         self.local_paste_finish(&mut out);
@@ -173,7 +175,7 @@ impl Router {
                 if PASTE_END.starts_with(&pending[at..]) {
                     break;
                 }
-                if self.mode == InputMode::Normal {
+                if self.mode != InputMode::Local {
                     let n = pending[at..]
                         .iter()
                         .position(|b| *b == 0x1b)
@@ -187,15 +189,30 @@ impl Router {
                 }
                 continue;
             }
-            if self.mode == InputMode::Normal
+            // In wrapper dialogs, Escape followed by another escape sequence
+            // is a close key, not an Alt+Escape token to discard. Preserve the
+            // second sequence for mouse reports, arrows and terminal replies.
+            if self.mode == InputMode::Local
+                && self.prefix.is_none()
+                && !self.pass_next
+                && pending[at..].starts_with(b"\x1b\x1b")
+            {
+                out.push(Action::LocalKey(Key::Escape));
+                at += 1;
+                continue;
+            }
+            if self.mode != InputMode::Local
                 && self.prefix.is_none()
                 && !self.pass_next
                 && pending[at] != 0x1b
                 && pending[at] != 0x1d
+                && !(self.mode == InputMode::Browse && pending[at] == 3)
             {
                 let n = pending[at..]
                     .iter()
-                    .position(|b| *b == 0x1b || *b == 0x1d)
+                    .position(|b| {
+                        *b == 0x1b || *b == 0x1d || (self.mode == InputMode::Browse && *b == 3)
+                    })
                     .unwrap_or(pending.len() - at);
                 forward(&mut out, &pending[at..at + n]);
                 at += n;
@@ -229,7 +246,7 @@ impl Router {
                     if self.pass_next {
                         forward(&mut out, &bytes);
                         self.pass_next = false;
-                    } else if self.mode == InputMode::Normal {
+                    } else if self.mode != InputMode::Local {
                         forward(&mut out, &bytes);
                     } else if bytes == [0x1b] {
                         out.push(Action::LocalKey(Key::Escape));
@@ -264,6 +281,7 @@ impl Router {
                     Some('+') | Some('=') => out.push(Action::PinResize(2)),
                     Some('-') => out.push(Action::PinResize(-2)),
                     Some('/') => out.push(Action::Search),
+                    Some('r') => out.push(Action::Requests),
                     Some('?') => out.push(Action::Help),
                     Some('p') => self.pass_next = true,
                     Some('\x1d') => forward(&mut out, &token),
@@ -279,22 +297,26 @@ impl Router {
                 continue;
             }
             if kitty_release(&token) {
-                if self.mode == InputMode::Normal && normal_action(&token).is_none() {
+                if self.mode != InputMode::Local && normal_action(&token).is_none() {
                     forward(&mut out, &token);
                 }
                 continue;
             }
             if token == b"\x1b[200~" {
                 self.paste = true;
-                if self.mode == InputMode::Normal {
+                if self.mode != InputMode::Local {
                     forward(&mut out, &token);
                 }
                 continue;
             }
             if terminal_reply(&token) {
                 out.push(Action::TerminalReply(token));
-            } else if self.mode == InputMode::Normal {
-                if let Some(action) = normal_action(&token) {
+            } else if self.mode != InputMode::Local {
+                if self.mode == InputMode::Browse
+                    && matches!(local_action(&token), Some(Action::LocalKey(Key::Ctrl(3))))
+                {
+                    out.push(Action::QuitBrowse);
+                } else if let Some(action) = normal_action(&token) {
                     out.push(action);
                 } else {
                     forward(&mut out, &token);
@@ -633,6 +655,9 @@ fn terminal_reply(token: &[u8]) -> bool {
 }
 
 fn local_action(token: &[u8]) -> Option<Action> {
+    if token == b"\x1b[27;5;99~" {
+        return Some(Action::LocalKey(Key::Ctrl(3)));
+    }
     if let Some(key) = kitty_key(token) {
         if key.event == 3 || key.modifiers & !(1 | 4) != 0 {
             return None;
@@ -720,6 +745,36 @@ fn local_action(token: &[u8]) -> Option<Action> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn repeated_escape_closes_local_ui_without_eating_the_next_sequence() {
+        let mut r = Router::new();
+        r.set_mode(InputMode::Local);
+        assert_eq!(r.feed(b"\x1b\x1b"), vec![Action::LocalKey(Key::Escape)]);
+        assert_eq!(r.flush_timeout(), vec![Action::LocalKey(Key::Escape)]);
+        assert_eq!(
+            r.feed(b"\x1b\x1b[<65;1;2M"),
+            vec![Action::LocalKey(Key::Escape), Action::Scroll(-3)]
+        );
+        r.set_mode(InputMode::Normal);
+        assert_eq!(
+            r.feed(b"\x1b\x1b[<65;1;2M"),
+            vec![Action::Forward(b"\x1b\x1b[<65;1;2M".to_vec())]
+        );
+    }
+    #[test]
+    fn browse_only_reserves_cancel_and_preserves_composer_and_paste() {
+        for key in [b"\x03".as_slice(), b"\x1b[99;5u", b"\x1b[27;5;99~"] {
+            let mut router = Router::new();
+            router.set_mode(InputMode::Browse);
+            assert_eq!(router.feed(key), vec![Action::QuitBrowse]);
+            router.set_mode(InputMode::Normal);
+            assert_eq!(router.feed(key), vec![Action::Forward(key.to_vec())]);
+        }
+        let mut router = Router::new();
+        router.set_mode(InputMode::Browse);
+        let keys = b"\x1b[A\x1b[B\ttext\x1b[200~\x03\x1b[201~";
+        assert_eq!(router.feed(keys), vec![Action::Forward(keys.to_vec())]);
+    }
     #[test]
     fn pin_commands_do_not_consume_native_letters() {
         let mut r = Router::new();

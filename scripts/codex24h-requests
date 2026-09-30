@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Read only the rollout owned by this wrapper's child (never guess --last)."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+
+class SessionUnavailable(RuntimeError):
+    pass
+
+
+def process_tree(root):
+    todo = [root]
+    seen = set()
+    while todo:
+        pid = todo.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        yield pid
+        try:
+            for task in Path(f'/proc/{pid}/task').iterdir():
+                todo.extend(map(int, (task/'children').read_text().split()))
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            pass
+
+
+def rollout(root, home):
+    attached = os.environ.get('CODEX24H_TMUX_CLIENT')
+    if attached:
+        socket, _, pane, _ = json.loads(attached)
+        root = int(subprocess.check_output(['tmux', '-S', socket, 'display-message', '-p', '-t', pane, '#{pane_pid}'], timeout=3))
+    # Prefer the nearest process owning a session; descendants may be subagents.
+    for pid in process_tree(root):
+        locks, paths = set(), set()
+        try:
+            for fd in Path(f'/proc/{pid}/fd').iterdir():
+                try:
+                    path = Path(os.readlink(fd))
+                    if path.name.startswith('rollout-') and path.suffix == '.jsonl':
+                        paths.add(path)
+                    if path.parent.name == 'thread-writer-locks' and path.suffix == '.lock':
+                        info = Path(f'/proc/{pid}/fdinfo/{fd.name}').read_text()
+                        if any(line.startswith('lock:') and ' WRITE ' in line and f' {pid} ' in line for line in info.splitlines()):
+                            locks.add(path.stem)
+                except (FileNotFoundError, PermissionError, ProcessLookupError):
+                    continue
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if len(locks) > 1:
+            raise RuntimeError('This process owns multiple sessions; cannot select one safely')
+        if locks:
+            session = next(iter(locks))
+            matching = [p for p in paths if p.name.endswith(session+'.jsonl')]
+            if len(matching) == 1:
+                return matching[0]
+            for directory in ('sessions', 'archived_sessions'):
+                matching = list((home/directory).glob(f'**/*{session}.jsonl'))
+                if len(matching) == 1:
+                    return matching[0]
+        if len(paths) == 1 and not locks:
+            return next(iter(paths))
+    raise SessionUnavailable('Current session record is not available yet; close and reopen the list after Codex is ready')
+
+
+def read_session(path):
+    events, messages = [], []
+    session = ''
+    # Keep request labels only: tool outputs and assistant bodies can be huge.
+    with path.open() as stream:
+        end = os.fstat(stream.fileno()).st_size
+        while stream.tell() < end:
+            raw = stream.readline()
+            if not raw.endswith('\n'):
+                break
+            record = json.loads(raw)
+            payload = record.get('payload', {})
+            kind = payload.get('type')
+            if record.get('type') == 'session_meta':
+                session = payload.get('id', '')
+            elif record.get('type') == 'event_msg' and kind == 'user_message':
+                events.append({'text': payload.get('message', '')})
+            elif record.get('type') == 'response_item' and kind == 'message' and payload.get('role') == 'user':
+                text = '\n'.join(p.get('text', '') for p in payload.get('content', []) if p.get('type') == 'input_text')
+                if not text.lstrip().startswith(('<environment_context>', '# AGENTS.md instructions', '<permissions instructions>', '<turn_aborted>')):
+                    messages.append({'text': text})
+    # Explicit user events take precedence over mirrored model input records.
+    return {'session': session, 'requests': events if events else messages}
+
+
+
+if __name__ == '__main__':
+    try:
+        home = Path(os.environ.get('CODEX_HOME', str(Path.home()/'.codex')))
+        deadline = time.monotonic()+3
+        while True:
+            try:
+                path = rollout(int(sys.argv[1]), home)
+                break
+            except SessionUnavailable:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(.1)
+        print(json.dumps(read_session(path), ensure_ascii=False))
+    except Exception as exc:
+        print(json.dumps({'error': str(exc)}))

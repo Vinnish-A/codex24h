@@ -11,6 +11,7 @@ install -m 755 target/release/codex24h "$temporary_binary"
 mv -f -- "$temporary_binary" "$bin_dir/codex24h"
 install -m 755 scripts/codex24h-mail "$bin_dir/codex24h-mail"
 install -m 755 scripts/codex24h-attach "$bin_dir/codex24h-attach"
+install -m 755 scripts/codex24h-requests "$bin_dir/codex24h-requests"
 install -m 755 scripts/codex24h-session "$bin_dir/codex24h-session"
 printf 'Installed %s/codex24h\n' "$bin_dir"
 printf 'Run: codex24h [the same arguments you pass to codex]\n'

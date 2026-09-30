@@ -12,7 +12,7 @@ Codex CLI 的轻量终端包装器，提供稳定的滚动和历史浏览。上�
 
 ## 安装
 
-支持 Linux / WSL，需要已安装 Rust 和 Codex。
+支持 Linux / WSL，需要已安装 Rust、Python 3 和 Codex。
 
 ```bash
 git clone https://github.com/Vinnish-A/codex24h.git
@@ -35,17 +35,31 @@ codex24h resume --last
 | 操作 | 按键 |
 |---|---|
 | 浏览聊天记录 | 滚轮 / PageUp / PageDown |
-| 返回最新内容 | 下滚到底部，或 Ctrl+] 然后 b |
+| 返回最新内容 | 浏览时 Ctrl+C，或 Ctrl+] 然后 b |
 | 召回历史输入 | 输入框中的 ↑ / ↓ |
 | 原生补全 | Tab |
 | 固定输入区开关 / 调整高度 | Ctrl+] 然后 i / + / - |
 | 搜索历史 | Ctrl+] 然后 / |
+| 当前 session 请求列表 | Ctrl+] 然后 r |
 | 复制 | 按住 Shift 用终端划选，再按 Ctrl+Shift+C |
 | 帮助 | Ctrl+] 然后 ? |
 
-文字划选和复制完全由 SSH 客户端处理，wrapper 不生成选区、不自动复制，也没有复制模式。保留滚轮需要开启鼠标上报，因此通常需按住 Shift 才能使用终端原生划选；复制快捷键以客户端设置为准。图片插件不参与文字复制。
+划选和复制由终端处理：按住 Shift 拖选，再按 Ctrl+Shift+C（以客户端设置为准）。手机滑屏需要 SSH 客户端支持发送滚轮事件。
 
-手机触控滚动需要 SSH 客户端支持发送滚轮事件，否则可使用软键盘翻页。`resume` 的可浏览历史仅包含 Codex 本次实际输出的内容，暂不支持完整历史补齐。
+### 跳转到之前的请求
+
+按 **Ctrl+] 然后 r** 打开当前会话的请求列表，↑↓ 选择，输入关键词筛选，Enter 跳转，Esc 取消。
+
+普通滚动保留本次终端收到的内容。更早的请求标为 `[full history]`，通过 Codex 原生全文历史打开，无需重新登录或发送模型请求。
+
+在全文历史中：
+
+- 滚轮 / PageUp / PageDown 阅读上下文。
+- Ctrl+P / Enter 跳到上一条 / 下一条请求。
+- 按 `/` 搜索后，Ctrl+P / Enter 改为跳到上一个 / 下一个匹配。
+- Ctrl+C / Esc 返回输入框。
+
+### 接入正在运行的 Codex
 
 已经在 tmux 单窗格窗口里运行的 Codex，可以从另一个终端接入，不必重启：
 
@@ -54,19 +68,19 @@ codex24h attach --list
 codex24h attach <PID>
 ```
 
-按 Ctrl+] 然后 d 断开，原任务继续运行。需要 tmux、Python 3 和 `tic`。**全屏模式下可能只有画面冻结，没有可翻的聊天历史**，`--list` 会标注；普通终端进程暂不支持接入。新会话仍建议直接用 `codex24h`。详见[接入说明](docs/attach.md)。
+按 Ctrl+] 然后 d 断开，任务继续运行。需要 tmux、Python 3 和 `tic`；仅支持 tmux 单窗格窗口，全屏模式可能没有可翻阅的历史，见[接入说明](docs/attach.md)。
 
 ## 图片粘贴
 
-通过 SSH 使用时，建议选择 [Tabby](https://tabby.sh)，并安装 [tabby-ssh-image-paste](https://github.com/Vinnish-A/tabby-ssh-image-paste)。Windows 上复制截图后，在远程 Codex 输入框按 `Ctrl+V` 或 `Ctrl+Shift+V`，插件会通过当前连接的 SFTP 上传图片并填入路径，供 Codex 识别为附件。
+Windows SSH 用户建议使用 [Tabby](https://tabby.sh) 和 [tabby-ssh-image-paste](https://github.com/Vinnish-A/tabby-ssh-image-paste) 插件，支持图片及图文混合粘贴。
 
-服务器需支持 SFTP，且 `/tmp` 可写；无需额外登录或服务端插件。插件尚未上架商店，按其 [安装说明](https://github.com/Vinnish-A/tabby-ssh-image-paste#安装到-windows-tabby) 下载并双击 `install.cmd`，再重启 Tabby。后续更新双击同一个脚本即可；插件不在后台自动更新。支持整段文字与多张图片按顺序粘贴。
+按[安装说明](https://github.com/Vinnish-A/tabby-ssh-image-paste#安装到-windows-tabby)下载并双击 `install.cmd`，重启 Tabby。更新也双击同一脚本，不会后台自动更新。
+
+使用 Tabby 原生 SSH 连接，在 Codex 输入框按 Ctrl+V 或 Ctrl+Shift+V。图片通过当前连接的 SFTP 上传；服务器需支持 SFTP，且 `/tmp` 可写。
 
 ## 邮件通知
 
-可在每轮回答完成后自动发送邮件，附上会话名和恢复命令。Goal 完成时会特别标注。由本机程序触发，不需要 agent 介入。
-
-需要配置 SMTP 邮箱，见[邮件通知设置](docs/mail.md)。
+配置 SMTP 后，每轮回答完成会自动发邮件，附上会话名和恢复命令；Goal 完成会特别标注。无需 agent 介入，见[邮件通知设置](docs/mail.md)。
 
 详细配置见[使用说明](docs/usage.md)，验证范围见[测试记录](TESTING.md)。
 

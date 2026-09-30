@@ -244,8 +244,10 @@ class AttachTest(unittest.TestCase):
         self.wait(lambda: b'burst:10' in self.log('events.log'), terminal)
         terminal.drain(.4)
         self.assertEqual(self.body(terminal)[:-1], frozen)
-        terminal.send(b'\x1db:question\n')
+        before_cancel = len(self.log('stdin.bin'))
+        terminal.send(b'\x03:question\n')  # Leave history, then resume native input in the same read.
         self.wait(lambda: 'QUESTION:Choose a review path' in self.body(terminal)[0], terminal)
+        self.assertNotIn(b'\x03', self.log('stdin.bin')[before_cancel:])
         terminal.send(b'\x1b[B\r')
         self.wait(lambda: b'option:Review changes' in self.log('answer.log'), terminal)
         terminal.resize(31, 92)

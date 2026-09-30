@@ -52,6 +52,7 @@ pub enum Mode {
     SearchResults,
     Search,
     Help,
+    Requests,
 }
 
 struct Document {
@@ -80,6 +81,73 @@ impl Document {
             }
         }
         chars
+    }
+
+    fn request_locations(&self, requests: &[String], caret: Option<usize>) -> Vec<Option<usize>> {
+        use std::collections::HashMap;
+        fn compact(s: &str) -> String {
+            s.chars().filter(|c| !c.is_whitespace()).collect()
+        }
+        let lines: Vec<String> = (0..self.rows.len())
+            .map(|r| {
+                self.row_chars(r, 0, self.cols - 1)
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect()
+            })
+            .collect();
+        // The live composer can contain a draft identical to an earlier request.
+        let limit = caret
+            .and_then(|caret| {
+                lines
+                    .iter()
+                    .take(caret + 1)
+                    .rposition(|s| s.trim_start().starts_with('›'))
+            })
+            .unwrap_or(lines.len());
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, request) in requests.iter().enumerate() {
+            groups.entry(compact(request)).or_default().push(i);
+        }
+        let max_len = groups.keys().map(String::len).max().unwrap_or(0);
+        let mut occurrences: HashMap<String, Vec<usize>> = HashMap::new();
+        for start in 0..limit {
+            let Some(first) = lines[start].trim_start().strip_prefix('›') else {
+                continue;
+            };
+            let mut candidate = compact(first);
+            let mut matched = None;
+            let mut end = start;
+            loop {
+                if !candidate.is_empty() && groups.contains_key(&candidate) {
+                    matched = Some(candidate.clone());
+                }
+                if candidate.len() >= max_len || end + 1 >= limit {
+                    break;
+                }
+                end += 1;
+                if lines[end].trim_start().starts_with('›') {
+                    break;
+                }
+                candidate.push_str(&compact(&lines[end]));
+            }
+            if let Some(query) = matched {
+                occurrences.entry(query).or_default().push(start);
+            }
+        }
+        let mut result = vec![None; requests.len()];
+        for (query, indices) in groups {
+            let Some(found) = occurrences.remove(&query) else {
+                continue;
+            };
+            // Missing identical occurrences are ambiguous; never guess which turn.
+            if found.len() == indices.len() {
+                for (index, row) in indices.into_iter().zip(found) {
+                    result[index] = Some(row);
+                }
+            }
+        }
+        result
     }
 
     fn find(
@@ -125,6 +193,16 @@ impl Document {
 }
 
 pub struct Core {
+    pub requests: crate::requests::Requests,
+    native_history: Option<crate::native_history::NativeHistory>,
+    pending_native_history: Option<(usize, Instant)>,
+    native_ready: bool,
+    reopen_requests: bool,
+    requests_return: Mode,
+    requests_previous: Option<Document>,
+    requests_caret: Option<usize>,
+    requests_need_index: bool,
+    requests_indexed: Instant,
     pub term: Term<Events>,
     parser: Processor,
     events: Events,
@@ -167,6 +245,16 @@ impl Core {
             events.clone(),
         );
         Self {
+            requests: Default::default(),
+            native_history: None,
+            pending_native_history: None,
+            native_ready: false,
+            reopen_requests: false,
+            requests_return: Mode::Follow,
+            requests_previous: None,
+            requests_caret: None,
+            requests_need_index: false,
+            requests_indexed: Instant::now(),
             term,
             parser: Processor::new(),
             events,
@@ -193,8 +281,16 @@ impl Core {
         }
     }
     pub fn input_mode(&self) -> InputMode {
-        if matches!(self.mode, Mode::SearchResults | Mode::Search | Mode::Help) {
+        if self.native_history.is_some() {
+            return InputMode::Local;
+        }
+        if matches!(
+            self.mode,
+            Mode::SearchResults | Mode::Search | Mode::Help | Mode::Requests
+        ) {
             InputMode::Local
+        } else if self.mode == Mode::Browse {
+            InputMode::Browse
         } else {
             InputMode::Normal
         }
@@ -227,6 +323,9 @@ impl Core {
         lines.join("\n")
     }
     pub fn process(&mut self, bytes: &[u8]) {
+        if self.mode == Mode::Requests {
+            self.requests_need_index = true;
+        }
         self.parser.advance(&mut self.term, bytes);
         self.handle_events();
         self.dirty = true;
@@ -269,6 +368,54 @@ impl Core {
         }
     }
     pub fn tick(&mut self) {
+        if self.native_history.is_some() {
+            let screen = self.exit_text();
+            if !self
+                .native_history
+                .as_mut()
+                .unwrap()
+                .tick(&screen, &mut self.pty_out)
+            {
+                if !self.native_history.as_ref().unwrap().was_cancelled() {
+                    self.note = "Native history did not open; no query was submitted".into();
+                }
+                self.native_history = None;
+                self.dirty = true;
+            }
+            self.native_ready |= self.native_history.as_ref().is_some_and(|h| h.is_open());
+        }
+
+        if self.reopen_requests
+            && self.native_history.is_none()
+            && !self
+                .exit_text()
+                .lines()
+                .next()
+                .is_some_and(|s| s.trim_start().starts_with("/ T R A N S C R I P T"))
+        {
+            self.reopen_requests = false;
+            self.action(Action::Requests);
+        }
+        if self.mode == Mode::Requests {
+            if self.requests.tick() {
+                self.index_requests();
+            } else if self.requests_need_index
+                && self.requests.locations.iter().any(Option::is_none)
+                && !self.requests.texts.is_empty()
+                && self.requests_indexed.elapsed() >= Duration::from_millis(250)
+            {
+                self.index_requests();
+            }
+        }
+        if let Some((index, since)) = self.pending_native_history {
+            if self.native_ready
+                || self.requests.locations.iter().any(Option::is_some)
+                || since.elapsed() >= Duration::from_secs(5)
+            {
+                self.pending_native_history = None;
+                self.open_native_history(index);
+            }
+        }
         if self
             .parser
             .sync_timeout()
@@ -409,6 +556,8 @@ impl Core {
         self.dirty = true;
     }
     fn bottom(&mut self) {
+        self.pending_native_history = None;
+        self.requests_previous = None;
         self.term.scroll_display(Scroll::Bottom);
         self.mode = Mode::Follow;
         self.frozen = None;
@@ -482,9 +631,105 @@ impl Core {
             cursor: (top, 0),
         });
     }
-    pub fn action(&mut self, action: Action) {
+    fn index_requests(&mut self) {
+        // Native resume can keep painting after the session file is available.
+        // Refresh destinations, not the selection or the previous browse view.
+        self.document = None;
+        let frozen = self.frozen.take();
+        self.document();
+        self.frozen = frozen;
+        self.requests_caret = self.term.mode().contains(TermMode::SHOW_CURSOR).then(|| {
+            self.term.history_size() + self.term.grid().cursor.point.line.0.max(0) as usize
+        });
+        self.requests.locations = self
+            .document
+            .as_ref()
+            .unwrap()
+            .request_locations(&self.requests.texts, self.requests_caret);
+        self.requests_need_index = false;
+        self.requests_indexed = Instant::now();
         self.dirty = true;
+    }
+    fn open_native_history(&mut self, index: usize) {
+        let history = crate::native_history::NativeHistory::new(&self.requests.texts, index);
+        self.bottom();
+        self.native_history = Some(history);
+        self.pty_out.push(0x14);
+    }
+    pub fn action(&mut self, action: Action) {
+        if !matches!(action, Action::TerminalReply(_))
+            && self.pending_native_history.take().is_some()
+        {
+            self.requests.message.clear();
+        }
+        self.dirty = true;
+        if let Some(history) = &mut self.native_history {
+            if history.navigate_request(&action, &self.requests.texts, &mut self.pty_out) {
+                return;
+            }
+            if matches!(action, Action::Requests) {
+                self.reopen_requests = true;
+                history.action(&Action::Bottom, &mut self.pty_out, self.size.rows);
+                return;
+            }
+            if !matches!(action, Action::TerminalReply(_)) {
+                history.action(&action, &mut self.pty_out, self.size.rows);
+                return;
+            }
+        }
+        if self.mode == Mode::Requests
+            && !matches!(action, Action::Bottom | Action::TerminalReply(_))
+        {
+            match self.requests.action(&action, self.size) {
+                crate::requests::Choice::Close => {
+                    self.document = self.requests_previous.take();
+                    self.mode = self.requests_return;
+                    if self.mode == Mode::Follow {
+                        self.unread = 0;
+                    }
+                }
+                crate::requests::Choice::Jump(index) => {
+                    if self.requests_need_index {
+                        self.index_requests();
+                    }
+                    if let Some(row) = self.requests.locations.get(index).copied().flatten() {
+                        let doc = self.document.as_mut().unwrap();
+                        doc.top = row.min(doc.rows.len().saturating_sub(self.size.rows));
+                        doc.cursor = (row, 0);
+                        self.requests_previous = None;
+                        self.frozen = None;
+                        self.mode = Mode::Browse;
+                        self.note = format!("Request {} · native terminal history", index + 1);
+                    } else {
+                        if self.native_ready || self.requests.locations.iter().any(Option::is_some)
+                        {
+                            self.open_native_history(index);
+                        } else {
+                            // Labels can arrive before native resume has configured
+                            // the conversation. Ctrl+T during that gap is discarded.
+                            self.pending_native_history = Some((index, Instant::now()));
+                            self.requests.message =
+                                "Waiting for Codex to restore history · Esc: cancel".into();
+                        }
+                    }
+                }
+                crate::requests::Choice::Stay => {}
+            }
+            return;
+        }
         match action {
+            Action::Requests => {
+                self.requests_return = self.mode;
+                self.requests_previous = self.document.take();
+                let frozen = self.frozen.take();
+                self.document();
+                self.frozen = frozen;
+                self.requests_caret = self.term.mode().contains(TermMode::SHOW_CURSOR).then(|| {
+                    self.term.history_size() + self.term.grid().cursor.point.line.0.max(0) as usize
+                });
+                self.mode = Mode::Requests;
+                self.requests.open();
+            }
             Action::Forward(bytes) => self.pty_out.extend(bytes),
             Action::TerminalReply(bytes) => {
                 if bytes.starts_with(b"\x1b]52;") && self.clipboard_pending.is_some() {
@@ -747,6 +992,15 @@ impl Core {
         out
     }
     pub fn frame(&self) -> Frame {
+        if let Some(history) = &self.native_history {
+            let mut frame = self.live_frame();
+            frame.status = history.status().into();
+            return frame;
+        }
+
+        if self.mode == Mode::Requests {
+            return self.requests.frame(self.size);
+        }
         let mut frame = if let Some(doc) = &self.document {
             let mut cells = vec![Cell::default(); self.size.rows * self.size.cols];
             for r in 0..self.size.rows {
@@ -809,7 +1063,7 @@ impl Core {
         frame.status = match self.mode {
             Mode::Follow => "codex24h · PgUp / wheel: history · Ctrl+] ?: help".into(),
             Mode::Browse => format!(
-                "HISTORY (frozen) · ↓ {} new updates · PgDn: latest · Ctrl+] b: bottom · /: search via Ctrl+]{}",
+                "HISTORY (frozen) · Ctrl+C: latest · ↓ {} new updates · PgDn / Ctrl+] b: bottom · Ctrl+] /: search{}",
                 self.unread,
                 if self.term.history_size() >= self.history_limit {
                     " · history limit"
@@ -831,6 +1085,7 @@ impl Core {
                     self.note.clone()
                 }
             }
+            Mode::Requests => unreachable!(),
             Mode::Help => "HELP · Esc: browse · Ctrl+] b: live".into(),
         };
         if matches!(self.mode, Mode::Follow | Mode::Browse) && !self.note.is_empty() {
@@ -845,6 +1100,7 @@ impl Core {
                 "Wheel / PageUp / PageDown   browse terminal history",
                 "Ctrl+] then b              return to latest",
                 "Ctrl+] then i / + / -      toggle / grow / shrink live input",
+                "Ctrl+] then r              list session requests / jump to context",
                 "Ctrl+] then /              search history (literal, case sensitive)",
                 "Ctrl+] then p              pass next key unchanged",
                 "Ctrl+] then Ctrl+]         send literal Ctrl+]",
@@ -950,6 +1206,81 @@ mod tests {
     }
     fn text(c: &Core) -> String {
         c.frame().cells.iter().map(|c| c.c).collect()
+    }
+    #[test]
+    fn request_jump_uses_native_styled_rows_not_session_text() {
+        let mut c = core(100);
+        c.process("› 重复请求\r\n\x1b[32m• first answer\x1b[0m\r\n\r\n› 重复请求\r\n• second answer\r\n\r\n› draft".as_bytes());
+        c.action(Action::Requests);
+        let texts = vec!["重复请求".into(), "重复请求".into(), "missing".into()];
+        let locations = c
+            .document
+            .as_ref()
+            .unwrap()
+            .request_locations(&texts, c.requests_caret);
+        assert_eq!(locations, vec![Some(0), Some(3), None]);
+        c.requests.texts = texts;
+        c.requests.locations = locations;
+        let expected = c.document.as_ref().unwrap().rows[1].clone();
+        c.action(Action::LocalKey(Key::Enter));
+        assert_eq!(c.mode, Mode::Browse);
+        assert_eq!(c.document.as_ref().unwrap().rows[1], expected);
+        assert!(text(&c).contains("• first answer"));
+        assert!(c.frame().status.contains("native terminal history"));
+        c.process(b"\x1b[2Jbackground repaint");
+        assert_eq!(c.document.as_ref().unwrap().rows[1], expected);
+        c.action(Action::Forward(b"\t".to_vec()));
+        assert_eq!(c.pty_out, b"\t");
+    }
+    #[test]
+    fn ambiguous_evicted_duplicate_and_live_draft_are_not_jump_targets() {
+        let mut c = core(100);
+        c.process("› same\r\n• answer\r\n\r\n› same".as_bytes());
+        c.action(Action::Requests);
+        let doc = c.document.as_ref().unwrap();
+        assert_eq!(
+            doc.request_locations(&["same".into()], c.requests_caret),
+            vec![Some(0)]
+        );
+        assert_eq!(
+            doc.request_locations(&["same".into(), "same".into()], c.requests_caret),
+            vec![None, None]
+        );
+        c.requests.texts = vec!["not present".into()];
+        c.requests.locations = vec![None];
+        c.action(Action::LocalKey(Key::Enter));
+        assert!(c.pending_native_history.is_some());
+        assert!(c.pty_out.is_empty());
+        c.requests.locations = vec![None, Some(0)];
+        c.tick();
+        assert!(c.native_history.is_some());
+        assert_eq!(c.pty_out, b"\x14");
+    }
+    #[test]
+    fn request_overlay_preserves_browse_and_never_forwards_navigation() {
+        let mut c = core(50);
+        c.process(b"original");
+        c.action(Action::Scroll(1));
+        let before = text(&c);
+        c.action(Action::Requests);
+        assert_eq!(c.input_mode(), InputMode::Local);
+        c.action(Action::LocalKey(Key::Char('x')));
+        c.action(Action::PageDown);
+        c.action(Action::Mouse {
+            button: 0,
+            col: 1,
+            row: 1,
+            release: false,
+        });
+        c.process(b"\x1b[2Jnew output");
+        assert!(c.pty_out.is_empty());
+        c.action(Action::LocalKey(Key::Escape));
+        assert_eq!(c.mode, Mode::Browse);
+        assert_eq!(text(&c), before);
+        c.action(Action::Requests);
+        c.action(Action::Bottom);
+        assert_eq!(c.mode, Mode::Follow);
+        assert!(text(&c).contains("new output"));
     }
     #[test]
     fn mouse_drag_never_copies_or_freezes_output() {
@@ -1218,7 +1549,7 @@ mod tests {
             Some((1, 0))
         );
         c.action(Action::LocalKey(Key::Escape));
-        assert_eq!(c.input_mode(), InputMode::Normal);
+        assert_eq!(c.input_mode(), InputMode::Browse);
         assert_eq!(c.mode, Mode::Browse);
     }
     #[test]
@@ -1282,7 +1613,7 @@ mod tests {
         assert_eq!(c.mode, Mode::Help);
         c.action(Action::LocalKey(Key::Escape));
         assert_eq!(c.mode, Mode::Browse);
-        assert_eq!(c.input_mode(), InputMode::Normal);
+        assert_eq!(c.input_mode(), InputMode::Browse);
         assert!(text(&c).contains("original"));
         assert!(!text(&c).contains("codex24h "));
         c.action(Action::Search);
@@ -1314,7 +1645,7 @@ mod tests {
         c.action(Action::PageUp);
         c.action(click);
         assert_eq!(c.mode, Mode::Browse);
-        assert_eq!(c.input_mode(), InputMode::Normal);
+        assert_eq!(c.input_mode(), InputMode::Browse);
     }
 
     #[test]

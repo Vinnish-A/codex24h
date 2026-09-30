@@ -108,6 +108,7 @@ fn run() -> Result<i32> {
         outer.enter(caps.kitty)?;
         let mut core = Core::new(size, history, caps.kitty, caps.foreground, caps.background);
         core.pin_rows = pin_rows;
+        core.requests.pid = child.process_id();
         let mut router = Router::new();
         router.set_detachable(attached);
         let mut renderer = Renderer::new();
