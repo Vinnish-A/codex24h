@@ -53,8 +53,7 @@ impl Requests {
                     helper =
                         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/codex24h-requests");
                 }
-                let output = Command::new("python3")
-                    .arg(helper)
+                let output = Command::new(helper)
                     .arg(pid.to_string())
                     .output()
                     .map_err(|e| e.to_string())?;

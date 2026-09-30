@@ -2,42 +2,76 @@
 set -euo pipefail
 
 bin_dir="${CODEX24H_BIN_DIR:-$HOME/.local/bin}"
-for dependency in cargo python3 curl tar; do
+lib_dir="${CODEX24H_LIB_DIR:-$(dirname -- "$bin_dir")/lib/codex24h}"
+for dependency in curl tar sha256sum; do
     command -v "$dependency" >/dev/null || { printf 'Missing dependency: %s\n' "$dependency" >&2; exit 1; }
 done
+if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
+    printf 'Prebuilt releases currently support Linux x86_64 (including WSL).\n' >&2
+    exit 1
+fi
 
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/codex24h-install.XXXXXXXX")"
 stage_dir=""
+link_dir=""
 cleanup() {
     rm -rf -- "$work_dir"
     if [[ -n "$stage_dir" ]]; then rm -rf -- "$stage_dir"; fi
+    if [[ -n "$link_dir" ]]; then rm -rf -- "$link_dir"; fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-    project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-else
-    curl --fail --show-error --location \
-        https://codeload.github.com/Vinnish-A/codex24h/tar.gz/refs/heads/main \
-        --output "$work_dir/source.tar.gz"
-    tar -xzf "$work_dir/source.tar.gz" -C "$work_dir"
-    project_dir="$work_dir/codex24h-main"
+repo_url="https://github.com/Vinnish-A/codex24h"
+version="${CODEX24H_VERSION:-}"
+if [[ -z "$version" ]]; then
+    release_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' "$repo_url/releases/latest")"
+    version="${release_url##*/}"
 fi
+[[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { printf 'Invalid release version: %s\n' "$version" >&2; exit 1; }
+asset="codex24h-linux-x86_64.tar.gz"
+base_url="$repo_url/releases/download/$version"
+curl -fsSL "$base_url/$asset" -o "$work_dir/$asset"
+curl -fsSL "$base_url/$asset.sha256" -o "$work_dir/$asset.sha256"
+(cd "$work_dir" && sha256sum --check "$asset.sha256")
+mkdir "$work_dir/package"
+tar -xzf "$work_dir/$asset" -C "$work_dir/package"
+"$work_dir/package/codex24h-mail" --help >/dev/null
+[[ "$(cat "$work_dir/package/VERSION")" == "${version#v}" ]] || { printf 'Release version mismatch\n' >&2; exit 1; }
 
-cargo build --release --locked --manifest-path "$project_dir/Cargo.toml" --target-dir "$work_dir/target"
-mkdir -p "$bin_dir"
-stage_dir="$(mktemp -d "$bin_dir/.codex24h-install.XXXXXXXX")"
-install -m 755 "$work_dir/target/release/codex24h" "$stage_dir/codex24h"
-for helper in mail attach requests session; do
-    install -m 755 "$project_dir/scripts/codex24h-$helper" "$stage_dir/codex24h-$helper"
+mkdir -p "$bin_dir" "$lib_dir/releases"
+bin_dir="$(cd "$bin_dir" && pwd)"
+lib_dir="$(cd "$lib_dir" && pwd)"
+release_dir="$lib_dir/releases/$version"
+if [[ ! -d "$release_dir" ]]; then
+    stage_dir="$(mktemp -d "$lib_dir/.install.XXXXXXXX")"
+    cp -a "$work_dir/package/." "$stage_dir/"
+    mv -- "$stage_dir" "$release_dir"
+    stage_dir=""
+fi
+stage_dir="$(mktemp -d "$lib_dir/.links.XXXXXXXX")"
+ln -s "releases/$version" "$stage_dir/current"
+mv -Tf -- "$stage_dir/current" "$lib_dir/current"
+for program in codex24h codex24h-mail codex24h-attach codex24h-requests codex24h-session; do
+    # Rename on the destination filesystem, including custom bin directories.
+    link_dir="$(mktemp -d "$bin_dir/.codex24h-link.XXXXXXXX")"
+    ln -s "$lib_dir/current/$program" "$link_dir/$program"
+    mv -Tf -- "$link_dir/$program" "$bin_dir/$program"
+    rmdir "$link_dir"
+    link_dir=""
 done
-for program in "$stage_dir"/*; do
-    mv -f -- "$program" "$bin_dir/"
+# Keep an old release only while a running process still uses it.
+for old_dir in "$lib_dir"/releases/*; do
+    [[ "$old_dir" == "$release_dir" || ! -d "$old_dir" ]] && continue
+    in_use=false
+    for process in /proc/[0-9]*/exe; do
+        executable="$(readlink "$process" 2>/dev/null || true)"
+        if [[ "$executable" == "$old_dir/"* ]]; then in_use=true; break; fi
+    done
+    if [[ "$in_use" == false ]]; then rm -rf -- "$old_dir"; fi
 done
-printf 'Installed %s/codex24h\n' "$bin_dir"
-printf 'Run: codex24h [the same arguments you pass to codex]\n'
+printf 'Installed codex24h %s to %s\n' "$version" "$bin_dir"
 case ":$PATH:" in
     *":$bin_dir:"*) ;;
     *) printf 'Add %s to your PATH to use the codex24h command.\n' "$bin_dir" ;;

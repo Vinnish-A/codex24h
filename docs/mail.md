@@ -7,21 +7,34 @@
 ```text
 [Codex24h][本轮已完成] 整理实验数据
 [Codex24h][Goal 已完成] 整理实验数据
+[Codex24h][模型容量不足] 整理实验数据
 ```
 
-## 配置
+## 新服务器配置
 
-需要 Python 3.11 或更高版本，无需额外 Python 包。重新运行 `./install.sh` 会安装 `codex24h-mail`。
+以下操作在 **运行 codex24h 的 Linux / WSL 服务器上**完成，使用运行 Codex 的同一个用户。无需在 SSH 客户端电脑上配置邮件，也不需要克隆仓库。
+
+### 1. 安装并准备邮箱
+
+预编译 Release 已包含邮件程序及运行时，服务器不需要安装或升级 Python。已安装新版 codex24h 可跳过安装命令：
 
 ```bash
-mkdir -p ~/.config/codex24h
-cp config/mail.example.toml ~/.config/codex24h/mail.toml
-chmod 600 ~/.config/codex24h/mail.toml
+curl -fsSL https://raw.githubusercontent.com/Vinnish-A/codex24h/main/install.sh | bash
+export PATH="$HOME/.local/bin:$PATH"
+codex24h-mail --help
 ```
 
-编辑 `mail.toml`，填写 SMTP 服务器、发件邮箱和收件邮箱。例如网易 163 邮箱：
+在邮箱网页设置中开启 SMTP 服务，取得客户端授权码，并确认 SMTP 地址、端口和加密方式。授权码通常不是网页登录密码。服务器需要能连接邮箱的 SMTP 端口，不需要开放入站端口。
 
-```toml
+### 2. 创建配置
+
+下面是网易 163 的示例。先把 `your-name@163.com` 改成发件邮箱，把 `recipient@example.com` 改成收件邮箱（可以与发件邮箱相同），再执行。其他邮箱按服务商参数修改 `host`、`port` 和 `security`。
+
+```bash
+mail_dir="${XDG_CONFIG_HOME:-$HOME/.config}/codex24h"
+mkdir -p "$mail_dir"
+chmod 700 "$mail_dir"
+(umask 077; cat > "$mail_dir/mail.toml" <<'EOF'
 enabled = false
 host = "smtp.163.com"
 port = 465
@@ -30,29 +43,55 @@ from = "your-name@163.com"
 to = ["recipient@example.com"]
 username = "your-name@163.com"
 password_file = "smtp-password"
+EOF
+)
+chmod 600 "$mail_dir/mail.toml"
 ```
 
-`ssl` 使用隐式 TLS，常见端口为 465；`starttls` 使用 STARTTLS，常见端口为 587。按邮件服务商提供的参数填写。连接会验证服务器证书，不支持明文认证。
+此步骤用于首次配置，已有配置请直接编辑，避免覆盖。默认文件是 `~/.config/codex24h/mail.toml`；设置了 `XDG_CONFIG_HOME` 时使用其下的 `codex24h/mail.toml`。
 
-私有 SMTP 服务如使用自己的证书颁发机构，可用 `ca_file` 指定受信任的 CA 文件；省略时使用系统信任库。
-
-开启邮箱的 SMTP 服务后，在本机隐藏输入客户端授权码，然后发送测试邮件：
+### 3. 保存授权码并测试
 
 ```bash
 codex24h-mail set-password
 codex24h-mail test
 ```
 
-授权码写入本机文件，权限为 0600，不进入项目或命令参数。网易等邮箱通常使用专门的客户端授权码，而非网页登录密码。也可改用 `password_env` 指定环境变量，但该变量必须在执行通知的 Codex 进程环境中可用；共享后台进程下推荐使用文件。
+第一条命令提示后输入授权码，输入不会显示。授权码保存在配置旁的 `smtp-password` 文件中，权限为 0600，不写入命令参数或项目。
 
-测试成功后将 `enabled` 改为 `true`，重新启动会话即可：
+第二条命令会实际发一封测试邮件，不启动模型任务。显示 `Test email accepted by SMTP server.` 后检查收件箱及垃圾邮件；`enabled = false` 时也能测试。
+
+### 4. 启用自动通知
+
+确认收到测试邮件后，把配置中的 `enabled = false` 改成 `enabled = true`：
 
 ```bash
+sed -i 's/^enabled = false$/enabled = true/' "${XDG_CONFIG_HOME:-$HOME/.config}/codex24h/mail.toml"
 codex24h
-codex24h resume --last
+# 或恢复原会话：codex24h resume --last
 ```
 
-已有的运行中会话需要重新启动或恢复，才能接入通知。也支持 `codex24h exec` 的完成通知。
+之后每轮回答完成自动发信；Goal 完成会特别标注。已运行的会话需退出并通过 codex24h 恢复，才能接入通知；直接运行 `codex` 不会启用 wrapper 的通知配置。也支持 `codex24h exec`。
+
+## 模型容量不足
+
+原生 TUI 显示 `Selected model is at capacity` 或 `Loaded model is at capacity` 的红色错误行时，自动发送类型为 **模型容量不足** 的邮件，附会话名和恢复命令。它不代表任务完成，不会标成 Goal 完成。
+
+同一轮任务的容量错误只提示一次，重绘或重试不重复；下一轮再次遇到容量错误会重新提示。普通输入、回答中引用这些文字、全文历史浏览不会触发。该通知识别的是原生红色错误行，并非 session 错误事件；Codex 0.158.0 不保存这种事件到 session。当前只覆盖 codex24h 承载的 TUI，`exec` 的容量错误通知尚未支持。
+
+## 其他配置
+
+`ssl` 使用隐式 TLS，常见端口为 465；`starttls` 使用 STARTTLS，常见端口为 587。按服务商要求填写，连接会验证服务器证书，不支持明文认证。私有 SMTP 可用 `ca_file` 指定受信任的 CA 文件。
+
+也可用 `password_env` 指定授权码环境变量，不能与 `password_file` 同时设置；变量必须在 Codex 进程环境中可用，共享后台进程推荐使用文件。
+
+## 常见问题
+
+- **找不到 codex24h-mail**：确认已安装新版，并将 `~/.local/bin` 加入 PATH。
+- **缺少 tomllib**：运行的是旧版源码脚本，执行上面的一行命令更新到预编译 Release，无需升级系统 Python。
+- **认证失败 / SMTPAuthenticationError**：检查 SMTP 是否开启，使用客户端授权码，并确认 `username` 与发件邮箱。
+- **TimeoutError / 连接失败**：检查服务器出站防火墙、云服务商 SMTP 限制及端口是否与加密方式对应。
+- **测试成功但自动通知没有发送**：确认 `enabled = true`，同一服务器用户通过 codex24h 新启动或恢复会话，且未设置 `CODEX24H_MAIL=0`；再用下面的 `status` 检查。
 
 ## 失败与重试
 

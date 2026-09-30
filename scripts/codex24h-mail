@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Codex native notify callback and SMTP sender. Python 3.11+, standard library only."""
+"""Codex completion/capacity notifications and SMTP sender. Release bundles its runtime."""
 import argparse
 import contextlib
 import datetime
@@ -18,8 +18,19 @@ import sqlite3
 import ssl
 import subprocess
 import sys
+import runpy
+import uuid
 import time
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+
+def helper_command():
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "mail"]
+    return [sys.executable, str(Path(__file__).resolve())]
 
 
 def config_path():
@@ -199,7 +210,7 @@ def prepare(args):
         return
     password(cfg)  # Fail before entering raw terminal mode if credentials are unavailable.
     previous = previous_notify(args.codex_home, args.args)
-    command = [sys.executable, str(Path(__file__).resolve()), 'notify', '--config', str(Path(args.config).resolve()),
+    command = [*helper_command(), 'notify', '--config', str(Path(args.config).resolve()),
                '--codex-home', str(Path(args.codex_home).resolve()), '--since', str(time.time_ns() // 1_000_000),
                '--previous', json.dumps(previous)]
     # JSON's string-array syntax is valid TOML for these paths and command arguments.
@@ -235,17 +246,19 @@ def enqueue(cfg, config, home, since, event):
 
 
 def mail_message(cfg, key, payload):
-    kind = 'Goal 已完成' if payload['goal_completed'] else '本轮已完成'
+    kind = '模型容量不足' if payload.get('type') == 'model_capacity' else ('Goal 已完成' if payload['goal_completed'] else '本轮已完成')
     message = EmailMessage()
     message['From'], message['To'] = cfg['from'], ', '.join(cfg['to'])
     message['Subject'] = f'[Codex24h][{kind}] {payload["name"]}'
     when = datetime.datetime.fromtimestamp(payload['completed_at'] / 1000, datetime.timezone.utc)
     message['Date'] = email.utils.format_datetime(when)
     message['Message-ID'] = f'<{key}@codex24h.local>'
+    trigger = ('原生模型容量错误' if payload.get('type') == 'model_capacity' else 'Codex 原生完成事件')
+    time_label = '发生时间' if payload.get('type') == 'model_capacity' else '完成时间'
     message.set_content(f'{kind}\n\n会话：{payload["name"]}\nSession ID：{payload["session"]}\n'
-                        f'Turn ID：{payload["turn"]}\n完成时间：{when.isoformat()}\n\n'
+                        f'Turn ID：{payload["turn"]}\n{time_label}：{when.isoformat()}\n\n'
                         f'恢复会话：\ncodex24h resume {shlex.quote(payload["session"])}\n\n'
-                        '此邮件由 Codex 原生完成事件自动触发，未调用模型生成或发送。\n')
+                        f'此邮件由{trigger}自动触发，未调用模型生成或发送。\n')
     return message
 
 
@@ -316,7 +329,7 @@ def worker(config, key):
 
 
 def spawn_worker(config, key):
-    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'worker', '--config', str(config), key],
+    subprocess.Popen([*helper_command(), 'worker', '--config', str(config), key],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True, close_fds=True)
 
@@ -340,9 +353,11 @@ def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest='command', required=True)
-    for name in ('prepare', 'notify', 'worker', 'test', 'status', 'retry', 'set-password'):
+    for name in ('prepare', 'notify', 'worker', 'test', 'status', 'retry', 'set-password', 'capacity'):
         sub = subs.add_parser(name)
         sub.add_argument('--config', type=Path, default=config_path())
+        if name == 'capacity':
+            sub.add_argument('--pid', type=int, required=True)
         if name in ('prepare', 'notify'):
             sub.add_argument('--codex-home', type=Path, default=Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')))
         if name == 'prepare':
@@ -363,11 +378,42 @@ def main():
     elif args.command == 'worker':
         worker(args.config, args.key)
     else:
+        if args.command == 'capacity' and not args.config.is_file():
+            return
         cfg = load_config(args.config, allow_disabled=args.command in ('test', 'set-password'))
         if cfg is None:
             print('Email notifications are disabled.')
             return
-        if args.command == 'set-password':
+        if args.command == 'capacity':
+            lookup = runpy.run_path(str(Path(__file__).with_name('codex24h-requests')))
+            home = Path(os.environ.get('CODEX_HOME', str(Path.home()/'.codex')))
+            path = lookup['rollout'](args.pid, home)
+            turn = None
+            with path.open() as stream:
+                record = json.loads(stream.readline())
+                session = record['payload']['id']
+                for line in stream:
+                    if not line.endswith('\n'):
+                        break
+                    if '"turn_started"' in line or '"turn_context"' in line:
+                        row = json.loads(line)
+                        event = row.get('payload', {})
+                        if (row.get('type') == 'event_msg' and event.get('type') == 'turn_started') or row.get('type') == 'turn_context':
+                            turn = event.get('turn_id') or turn
+            meta = metadata(home, session)
+            if meta['subagent']:
+                return
+            turn = turn or str(uuid.uuid4())
+            key = hashlib.sha256((str(args.config.resolve()) + '\0' + session + '\0capacity\0' + turn).encode()).hexdigest()
+            payload = {'session': session, 'turn': turn, 'name': meta['name'],
+                       'completed_at': time.time_ns() // 1_000_000, 'goal_completed': False,
+                       'type': 'model_capacity'}
+            with database(cfg) as conn:
+                conn.execute('INSERT OR IGNORE INTO jobs(key,config,payload,state) VALUES (?,?,?,?)',
+                             (key, str(args.config.resolve()), json.dumps(payload, ensure_ascii=False), 'pending'))
+                conn.commit()
+            worker(args.config, key)
+        elif args.command == 'set-password':
             if not cfg.get('password_file'):
                 raise ValueError('set password_file in the mail config first')
             secret = getpass.getpass('SMTP authorization code (hidden): ')

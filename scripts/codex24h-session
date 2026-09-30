@@ -152,7 +152,7 @@ def main():
 if __name__ == '__main__':
     # Some Conda builds omit pidfd APIs despite a recent Python version.
     system_python = Path('/usr/bin/python3')
-    if '--takeover' in sys.argv and not hasattr(os, 'pidfd_open') and system_python.exists() and Path(sys.executable).resolve() != system_python.resolve():
+    if not getattr(sys, 'frozen', False) and '--takeover' in sys.argv and not hasattr(os, 'pidfd_open') and system_python.exists() and Path(sys.executable).resolve() != system_python.resolve():
         os.execv(str(system_python), [str(system_python), __file__, *sys.argv[1:]])
     try:
         sys.exit(main())

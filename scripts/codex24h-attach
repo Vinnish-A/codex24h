@@ -134,7 +134,7 @@ def main():
                  'set-option', '-t', session, 'prefix2', 'None', ';',
                  'set-option', '-t', session, 'destroy-unattached', 'off', ';',
                  'select-window', '-t', f'{session}:{window}')
-            env = dict(os.environ, CODEX24H_CODEX=str(Path(__file__).resolve()), CODEX24H_MAIL='0',
+            env = dict(os.environ, CODEX24H_CODEX=(str(Path(sys.executable).with_name('codex24h-attach')) if getattr(sys, 'frozen', False) else str(Path(__file__).resolve())), CODEX24H_MAIL='0',
                        CODEX24H_ATTACH_FULL_SCREEN=alternate,
                        CODEX24H_TMUX_CLIENT=json.dumps([socket, session, pane, terminfo]))
             # A persistent control connection writes literal bytes to the pane.

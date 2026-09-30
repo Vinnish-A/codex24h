@@ -322,6 +322,50 @@ impl Core {
         }
         lines.join("\n")
     }
+    /// Native errors are red `■` cells, never user/assistant prose or frozen history.
+    pub fn capacity_error(&self) -> Option<bool> {
+        use alacritty_terminal::vte::ansi::NamedColor;
+        if self.native_history.is_some() {
+            return None;
+        }
+        for row in 0..self.size.rows {
+            let cells = &self.term.grid()[Line(row as i32)];
+            let first = (0..self.size.cols).find(|&col| !cells[Column(col)].c.is_whitespace());
+            let Some(col) = first else { continue };
+            let cell = &cells[Column(col)];
+            if cell.c != '■'
+                || !matches!(
+                    cell.fg,
+                    Color::Named(NamedColor::Red | NamedColor::BrightRed)
+                )
+            {
+                continue;
+            }
+            let mut text = String::new();
+            for next in row..(row + 6).min(self.size.rows) {
+                let cells = &self.term.grid()[Line(next as i32)];
+                for col in 0..self.size.cols {
+                    let cell = &cells[Column(col)];
+                    if matches!(
+                        cell.fg,
+                        Color::Named(NamedColor::Red | NamedColor::BrightRed)
+                    ) && !cell.c.is_whitespace()
+                    {
+                        text.extend(cell.c.to_lowercase());
+                    }
+                }
+            }
+            if text.starts_with("■selectedmodelisatcapacity")
+                || text.starts_with("■loadedmodelisatcapacity")
+                || text.starts_with("■theloadedmodelisatcapacity")
+                || text.starts_with("■server_overloaded")
+            {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
     pub fn process(&mut self, bytes: &[u8]) {
         if self.mode == Mode::Requests {
             self.requests_need_index = true;
@@ -1207,6 +1251,32 @@ mod tests {
     fn text(c: &Core) -> String {
         c.frame().cells.iter().map(|c| c.c).collect()
     }
+    #[test]
+    fn capacity_notification_requires_native_red_error_and_ignores_history() {
+        let mut c = core(100);
+        c.process(
+            "› Selected model is at capacity
+■ Selected model is at capacity"
+                .as_bytes(),
+        );
+        assert_eq!(c.capacity_error(), Some(false));
+        c.process(
+            "[2J[H[31m■ Selected model is at capacity. Please try a different model.[0m"
+                .as_bytes(),
+        );
+        assert_eq!(c.capacity_error(), Some(true));
+        c.action(Action::Scroll(1));
+        assert_eq!(c.capacity_error(), Some(true));
+        c.native_history = Some(crate::native_history::NativeHistory::new(
+            &["request".into()],
+            0,
+        ));
+        assert_eq!(c.capacity_error(), None);
+        c.native_history = None;
+        c.process(b"[2J[Hnormal answer");
+        assert_eq!(c.capacity_error(), Some(false));
+    }
+
     #[test]
     fn request_jump_uses_native_styled_rows_not_session_text() {
         let mut c = core(100);

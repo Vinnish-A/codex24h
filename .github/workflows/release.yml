@@ -1,0 +1,32 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - uses: dtolnay/rust-toolchain@stable
+      - run: python -m pip install -r packaging/requirements.txt
+      - run: cargo test --locked
+      - run: bash packaging/build.sh
+      - name: Smoke test standalone helpers
+        run: |
+          mkdir -p /tmp/codex24h-release-smoke
+          tar -xzf target/release-assets/codex24h-linux-x86_64.tar.gz -C /tmp/codex24h-release-smoke
+          /tmp/codex24h-release-smoke/codex24h-mail --help
+          /tmp/codex24h-release-smoke/codex24h-session --help
+          /tmp/codex24h-release-smoke/codex24h-attach --help
+          python tests/release.py /tmp/codex24h-release-smoke
+      - name: Publish release and binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" target/release-assets/* \
+            --verify-tag --title "Codex24h $GITHUB_REF_NAME" --notes-file packaging/release-notes.md

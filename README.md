@@ -12,13 +12,13 @@ Codex CLI 的轻量终端包装器，提供稳定的滚动和历史浏览。上�
 
 ## 安装 / 更新
 
-支持 Linux / WSL，需要已安装 Rust、Python 3、curl 和 Codex。安装和更新使用同一条命令：
+支持 Linux x86_64 / WSL（glibc 2.35+，如 Ubuntu 22.04+）。已安装并登录 Codex 即可；无需 Rust、Python 或 pip。安装和更新使用同一条命令：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Vinnish-A/codex24h/main/install.sh | bash
 ```
 
-默认安装到 `~/.local/bin`。下载和编译在临时目录完成，结束后自动清理；保留 Cargo 共用的依赖缓存。
+从 [Release](https://github.com/Vinnish-A/codex24h/releases/latest) 下载预编译包并校验 SHA-256，命令放在 `~/.local/bin`。临时文件自动清理，运行中的会话不受更新影响。
 
 ## 使用
 
@@ -78,7 +78,7 @@ Windows SSH 用户建议使用 [Tabby](https://tabby.sh) 和 [tabby-ssh-image-pa
 
 ## 邮件通知
 
-配置 SMTP 后，每轮回答完成会自动发邮件，附上会话名和恢复命令；Goal 完成会特别标注。无需 agent 介入，见[邮件通知设置](docs/mail.md)。
+配置 SMTP 后，每轮回答完成会自动发邮件，附上会话名和恢复命令；Goal 完成和模型容量不足会分别标注。无需 agent 介入，新服务器按[邮件配置步骤](docs/mail.md#新服务器配置)创建配置、输入授权码并发送测试邮件。
 
 详细配置见[使用说明](docs/usage.md)，验证范围见[测试记录](TESTING.md)。
 

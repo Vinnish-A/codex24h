@@ -18,7 +18,10 @@ import subprocess
 import tempfile
 import threading
 import time
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -121,6 +124,16 @@ class MailTests(unittest.TestCase):
         self.assertIn('中文项目会话', str(message['Subject']))
         self.assertNotIn('PRIVATE', message.as_string())
         self.assertIn('codex24h resume session-1', message.get_content())
+
+    def test_capacity_mail_is_not_labelled_completed_or_goal(self):
+        payload = {'session': 'session-1', 'turn': 'capacity', 'name': 'test session',
+                   'completed_at': 1000, 'goal_completed': False, 'type': 'model_capacity'}
+        message = mail.mail_message(self.cfg, 'capacity-test', payload)
+        self.assertIn('[模型容量不足]', message['Subject'])
+        self.assertIn('发生时间', message.get_content())
+        self.assertIn('codex24h resume session-1', message.get_content())
+        self.assertNotIn('本轮已完成', message.get_content())
+        self.assertNotIn('原生完成事件', message.get_content())
 
     def test_old_goal_on_resume_is_not_a_new_completion(self):
         with sqlite3.connect(self.home / 'goals_1.sqlite') as conn:

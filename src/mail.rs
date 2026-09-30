@@ -28,8 +28,7 @@ pub fn arguments(mut args: Vec<OsString>) -> Result<Vec<OsString>, Box<dyn std::
     let home = env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".codex"));
-    let result = Command::new("python3")
-        .arg(helper)
+    let result = Command::new(helper)
         .arg("prepare")
         .arg("--config")
         .arg(config)
@@ -57,4 +56,32 @@ pub fn arguments(mut args: Vec<OsString>) -> Result<Vec<OsString>, Box<dyn std::
         );
     }
     Ok(args)
+}
+
+/// SMTP and session lookup run off the PTY loop, including waiting/reaping the helper.
+pub fn capacity(pid: u32) {
+    if env::var_os("CODEX24H_MAIL").is_some_and(|v| v == "0") {
+        return;
+    }
+    std::thread::spawn(move || {
+        let Ok(binary) = env::current_exe() else {
+            return;
+        };
+        let mut helper = binary.with_file_name("codex24h-mail");
+        if !helper.is_file() {
+            helper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/codex24h-mail");
+        }
+        let result = Command::new(helper)
+            .arg("capacity")
+            .arg("--pid")
+            .arg(pid.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .output();
+        if let Ok(output) = result {
+            if !output.status.success() {
+                eprintln!("{}", String::from_utf8_lossy(&output.stderr).trim());
+            }
+        }
+    });
 }

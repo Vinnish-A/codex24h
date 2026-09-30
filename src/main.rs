@@ -69,8 +69,7 @@ fn run() -> Result<i32> {
                 .join("scripts")
                 .join(name);
         }
-        return Err(Command::new("python3")
-            .arg(helper)
+        return Err(Command::new(helper)
             .arg("--wrapper")
             .arg(binary)
             .args(&args[1..])
@@ -104,6 +103,7 @@ fn run() -> Result<i32> {
     let mut child = pair.slave.spawn_command(cmd)?;
     drop(pair.slave);
     let mut final_screen = None;
+    let mut capacity_visible = false;
     let result = (|| -> Result<i32> {
         outer.enter(caps.kitty)?;
         let mut core = Core::new(size, history, caps.kitty, caps.foreground, caps.background);
@@ -330,6 +330,9 @@ fn run() -> Result<i32> {
                     Ok(n) => {
                         last_input = Instant::now();
                         urgent = true;
+                        if buf[..n].contains(&b'\r') || buf[..n].contains(&b'\n') {
+                            capacity_visible = false;
+                        }
                         if route(
                             &mut router,
                             &mut core,
@@ -353,7 +356,17 @@ fn run() -> Result<i32> {
                             eof = true;
                             break;
                         }
-                        Ok(n) => core.process(&buf[..n]),
+                        Ok(n) => {
+                            core.process(&buf[..n]);
+                            if let Some(capacity) = core.capacity_error() {
+                                if capacity && !capacity_visible {
+                                    if let Some(pid) = child.process_id() {
+                                        codex24h::mail::capacity(pid);
+                                    }
+                                }
+                                capacity_visible = capacity;
+                            }
+                        }
                         Err(e) if e.raw_os_error() == Some(libc::EIO) => {
                             eof = true;
                             break;

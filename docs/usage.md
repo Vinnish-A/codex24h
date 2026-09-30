@@ -6,7 +6,7 @@
 
 ## 安装与使用
 
-已安装 Rust、Python 3、curl 和 Codex 的 Linux / WSL 环境，安装和更新使用同一条命令：
+Linux x86_64 / WSL（glibc 2.35+）上已安装并登录 Codex。安装和更新下载预编译 Release，不需要 Rust、Python 或 pip：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Vinnish-A/codex24h/main/install.sh | bash
@@ -18,7 +18,9 @@ codex24h -C /path/to/project
 codex24h exec --json "your prompt"
 ```
 
-下载源码和构建产物会在安装结束、失败或中断后清理；保留 Cargo 共用依赖缓存。已有源码目录仍可运行 `./install.sh` 安装本地版本。
+预编译包包含主程序及辅助功能共用的运行时，下载后校验 SHA-256。临时文件自动清理；旧版本只在仍有进程使用时保留，下次更新清理。`CODEX24H_VERSION=v0.2.0` 可指定版本。
+
+开发者从源码构建仍需 Rust 和 Python，发布构建见 [packaging](../packaging/README.md)。
 
 安装位置默认 `~/.local/bin/codex24h`，入口统一为 `codex24h`。可用 `CODEX24H_BIN_DIR` 选择安装目录。原来的 `codex` 命令保持不变。
 
@@ -156,7 +158,7 @@ Shift+方向键的发送方式由客户端映射决定，不会把未收到的�
 - 跳转后保持原生颜色、换行和布局，可继续滚动；固定输入区仍可输入、补全。
 - 列表中 Esc / Ctrl+C 取消并恢复原视图；浏览记录时 Ctrl+C 或 `Ctrl+] b` 返回实时 Codex。
 
-需要 Python 3。只读当前进程的 session 文件以列出用户请求；不显示回答或工具调用的原始 JSON，不生成另一套聊天阅读器。请求文字用于在 VT 终端历史中定位，跳转后显示保存的终端单元格，后台输出不会拉走视图。
+预编译包已包含辅助程序。只读当前进程的 session 文件以列出用户请求；不显示回答或工具调用的原始 JSON，不生成另一套聊天阅读器。请求文字用于在 VT 终端历史中定位，跳转后显示保存的终端单元格，后台输出不会拉走视图。
 
 当前缓冲能准确定位的请求直接跳到原生终端记录。`resume`、上下文压缩或缓冲淘汰后的旧请求，转交 Codex 自带的 full transcript 搜索，列表标为 `[full history]`；不再把“尚未显示在缓冲里”标为不可用。
 
