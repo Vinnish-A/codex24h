@@ -259,3 +259,7 @@ Windows Tabby **1.0.237**，安装 npm 发布的 `tabby-ssh-image-clipboard` **0
 - 62 项 Rust 测试、12 项邮件测试通过；预编译包通过 13 项 PTY、15 项 tmux 接入回归。
 - `python3 tests/release.py BUNDLE_DIR` 在 PATH 不含 Python 时运行所有 helper；实际本地 TLS SMTP 验证后台完成通知、会话名称、不附正文、同轮去重及容量通知。通过完整 PTY 注入原生红色容量错误，验证普通引用不发信、重绘不重复、下一轮重新发信。测试不向外部邮箱投递。
 - 新服务器的安装和真实 SMTP 验证另行记录，不将本地测试等同于远程交付。
+
+- GitHub Actions Release 构建及包测试全部成功；实际下载 v0.2.0 的公开安装包约 7.7 MiB，解压约 18 MiB，再次通过无 Python PATH 的邮件/容量 PTY 测试。
+- 新服务器 Ubuntu 22.04 / Python 3.10.12 上安装已发布预编译包，helper 在 PATH 不含 Python 时启动正常；真实 SMTP 测试接收成功，配置和授权码均为 0600，原 Codex 进程未重启。GitHub Release 下载速度过慢，改通过 SSH 传输同一发布包并验证 SHA-256；传输文件及中断下载清理。
+- 本地 Release 包安装与重复更新通过，校验失败保留当前安装并清理临时目录。安装增加下载超时和本地包入口；不将此服务器的缓慢在线下载称为成功的一行在线安装。

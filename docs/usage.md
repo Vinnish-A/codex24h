@@ -18,7 +18,9 @@ codex24h -C /path/to/project
 codex24h exec --json "your prompt"
 ```
 
-预编译包包含主程序及辅助功能共用的运行时，下载后校验 SHA-256。临时文件自动清理；旧版本只在仍有进程使用时保留，下次更新清理。`CODEX24H_VERSION=v0.2.0` 可指定版本。
+预编译包包含主程序及辅助功能共用的运行时，下载后校验 SHA-256。临时文件自动清理；旧版本只在仍有进程使用时保留，下次更新清理。`CODEX24H_VERSION=v0.2.0` 可指定版本。下载超时会退出并清理，不无限等待。
+
+网络较慢时，可先下载 Release 的 tar.gz 及同名 `.sha256` 校验文件，再用 `CODEX24H_ARCHIVE=/path/to/codex24h-linux-x86_64.tar.gz bash install.sh` 安装本地包。仍执行校验，不编译。
 
 开发者从源码构建仍需 Rust 和 Python，发布构建见 [packaging](../packaging/README.md)。
 
