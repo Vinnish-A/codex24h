@@ -104,6 +104,8 @@ codex24h-mail retry
 
 同一会话的同一轮通过 Session ID 和 Turn ID 去重。SMTP 接收成功表示已交给邮件服务器，不保证最终进入收件箱；网络中断恰好发生在服务器接收之后时，重试仍可能导致重复邮件。
 
+入队和实际发信前均确认会话归属。子 agent、来源未知、元数据缺失或读取失败时不发信；无法确认归属的旧队列记录标为 `suppressed`，不会由 `retry` 重发。因此状态库不可用时可能漏掉主会话通知，恢复后也不会补发这些被拦截的邮件。主会话的一轮完成邮件不代表所有子 agent 都已结束。
+
 临时关闭通知：
 
 ```bash
@@ -116,11 +118,11 @@ CODEX24H_MAIL=0 codex24h resume --last
 
 使用 Codex 原生的 [`notify` / `agent-turn-complete` 事件](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications)。Wrapper 仅为本次启动附加通知配置，不修改 Codex 全局配置；原有通知命令仍会执行。没有轮询终端文字，没有用模型判断是否发信。
 
-会话名称和 Goal 状态从本机 Codex 元数据只读获取。目前适配本机 Codex 0.158.0 的状态库：名称优先使用手动命名，其次使用 Codex 保存的标题；取不到时以 Session ID 标识。邮件不附带对话正文。子 agent 的独立完成事件不发送邮件。
+会话名称、来源、父子关系和 Goal 状态从本机 Codex 元数据只读获取；版本验证范围见 [README](../README.md#codex-版本兼容)。名称优先使用手动命名，其次使用 Codex 保存的标题；名称为空时以 Session ID 标识。邮件不附带对话正文。子 agent 的独立完成事件和容量错误不发送邮件。
 
 Goal 必须在本次接入通知之后变为 `complete` 才会标注，且每个 Goal 只标注一次；恢复一个早已完成的 Goal 不会误报为新完成。它代表 Codex 的 Goal 状态，不额外判断任务的实际质量。
 
-本功能针对本机 Codex；远程 app-server 不在支持范围内。Codex 内部状态库的未来变更可能使名称回退到 ID 或无法标注 Goal，普通完成通知仍以原生事件为准。
+本功能针对本机 Codex；远程 app-server 不在支持范围内。Codex 内部状态库的未来变更若导致无法确认主会话身份，自动通知会停止发送。
 
 ## 验证
 

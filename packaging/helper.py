@@ -13,8 +13,6 @@ else:
 
 names = ('mail', 'attach', 'requests', 'session')
 name = Path(sys.argv[0]).name.removeprefix('codex24h-')
-if os.environ.get('CODEX24H_TMUX_CLIENT'):
-    name = 'attach'
 if sys.argv[1:] and sys.argv[1] in names:
     name = sys.argv.pop(1)
 if name not in names:

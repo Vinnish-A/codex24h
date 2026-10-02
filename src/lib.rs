@@ -6,4 +6,3 @@ pub mod native_history;
 pub mod render;
 pub mod requests;
 pub mod terminal;
-pub mod tmux_input;

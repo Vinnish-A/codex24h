@@ -16,6 +16,7 @@ use unicode_width::UnicodeWidthChar;
 #[derive(Default)]
 pub struct Requests {
     pub pid: Option<u32>,
+    pub session: Option<String>,
     pending: Option<Receiver<Result<Vec<String>, String>>>,
     pub texts: Vec<String>,
     pub locations: Vec<Option<usize>>,
@@ -44,6 +45,7 @@ impl Requests {
         }
         let (tx, rx) = mpsc::channel();
         self.pending = Some(rx);
+        let session = self.session.clone();
         std::thread::spawn(move || {
             let result = (|| {
                 let mut helper = std::env::current_exe()
@@ -53,10 +55,12 @@ impl Requests {
                     helper =
                         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/codex24h-requests");
                 }
-                let output = Command::new(helper)
-                    .arg(pid.to_string())
-                    .output()
-                    .map_err(|e| e.to_string())?;
+                let mut command = Command::new(helper);
+                command.arg(pid.to_string());
+                if let Some(session) = session {
+                    command.arg("--session").arg(session);
+                }
+                let output = command.output().map_err(|e| e.to_string())?;
                 if !output.status.success() {
                     return Err("Could not read request list".into());
                 }
@@ -162,7 +166,15 @@ impl Requests {
         put(
             &mut f,
             0,
-            &format!("Requests ({}) /{}", self.texts.len(), self.filter),
+            &format!(
+                "Requests ({}){} /{}",
+                self.texts.len(),
+                self.session
+                    .as_ref()
+                    .map(|s| format!(" · resumed {}", s))
+                    .unwrap_or_default(),
+                self.filter
+            ),
             false,
         );
         if !self.message.is_empty() {

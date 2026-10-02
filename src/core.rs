@@ -216,6 +216,7 @@ pub struct Core {
     bell: bool,
     last_live: Vec<Cell>,
     pub pin_rows: usize,
+    pub reconnected: bool,
     pub unread: u64,
     pub dirty: bool,
     pub query: String,
@@ -268,6 +269,7 @@ impl Core {
             bell: false,
             last_live: vec![],
             pin_rows: 0,
+            reconnected: false,
             unread: 0,
             dirty: true,
             query: String::new(),
@@ -1105,6 +1107,9 @@ impl Core {
             frame.cursor_shape = live.cursor_shape;
         }
         frame.status = match self.mode {
+            Mode::Follow if self.reconnected => {
+                "codex24h · wheel: history · Ctrl+] d: return to original page".into()
+            }
             Mode::Follow => "codex24h · PgUp / wheel: history · Ctrl+] ?: help".into(),
             Mode::Browse => format!(
                 "HISTORY (frozen) · Ctrl+C: latest · ↓ {} new updates · PgDn / Ctrl+] b: bottom · Ctrl+] /: search{}",

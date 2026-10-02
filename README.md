@@ -38,9 +38,9 @@ codex24h resume --last
 
 | Codex CLI | 验证内容 |
 |---|---|
-| 0.158.0 | 恢复会话、`← for agents`、Esc 返回、原生 Tab 补全、完成邮件；独立模式保留 `notify` 路径 |
-| 0.159.2 | 恢复会话、`← for agents`、Esc 返回、原生 Tab 补全、完成邮件 |
-| 0.160.0 | 恢复会话、`← for agents`、Esc 返回、原生 Tab 补全、完成邮件 |
+| 0.158.0 | 恢复会话、`← for agents`、Esc 返回、原生 Tab 补全、完成邮件、tmux 前端重连；独立模式保留 `notify` 路径 |
+| 0.159.2 | 恢复会话、`← for agents`、Esc 返回、原生 Tab 补全、完成邮件、tmux 前端重连 |
+| 0.160.0 | 恢复会话、`← for agents`、Esc 返回、原生 Tab 补全、完成邮件、tmux 前端重连 |
 
 共享模式的上述测试使用 **0.160.0 app-server**。CLI 与后台服务版本可以不同；wrapper 跟随所选 CLI，后台服务由 Codex 管理。旧版后台服务、未列出的 CLI 和其他平台不列为本轮已验证组合，见 [测试记录](TESTING.md)。
 
@@ -76,14 +76,9 @@ codex24h resume --last
 
 ### 接入正在运行的 Codex
 
-已经在 tmux 单窗格窗口里运行的 Codex，可以从另一个终端接入，不必重启：
+按 **Ctrl+B，然后 h** 打开会话选择弹窗，选择一次后进入正常 codex24h 前端，复用共享后台中的任务。原页面与草稿保留；新前端不会复制原草稿。按 **Ctrl+]，然后 d** 或退出新 Codex 返回原页面。
 
-```bash
-codex24h attach --list
-codex24h attach <PID>
-```
-
-按 Ctrl+] 然后 d 断开，任务继续运行。需要 tmux、Python 3 和 `tic`；仅支持 tmux 单窗格窗口，全屏模式可能没有可翻阅的历史，见[接入说明](docs/attach.md)。
+首次配置见[重连说明](docs/attach.md)。需要 tmux；旧的 PID 终端镜像入口已移除。请求列表绑定重连时选择的主会话，原生 agents 切换保持可用。
 
 ## 图片粘贴
 

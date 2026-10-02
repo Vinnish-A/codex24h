@@ -121,11 +121,13 @@ def database(cfg):
 
 def metadata(home, session):
     """Read metadata only; never scan or interpret the conversation text."""
-    result = {'name': session, 'subagent': False, 'goal': None}
+    # Unknown ownership must never be treated as a main session.
+    result = {'name': session, 'subagent': None, 'goal': None}
     paths = sorted(Path(home).glob('state_*.sqlite'),
                    key=lambda p: int(p.stem.split('_')[-1]) if p.stem.split('_')[-1].isdigit() else -1,
                    reverse=True)
-    for path in paths:
+    # The newest schema is authoritative; older databases can contain stale sources.
+    for path in paths[:1]:
         try:
             with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=.5)) as conn:
                 columns = {row[1] for row in conn.execute('PRAGMA table_info(threads)')}
@@ -133,7 +135,16 @@ def metadata(home, session):
                 row = conn.execute(f'SELECT {name}, title, source FROM threads WHERE id=?', (session,)).fetchone()
                 if row:
                     result['name'] = row[0] or row[1] or session
-                    result['subagent'] = 'subagent' in (row[2] or '')
+                    source = (row[2] or '').strip().strip('"').casefold()
+                    subagent = None
+                    if 'subagent' in source:
+                        subagent = True
+                    elif source in ('cli', 'exec', 'vscode', 'appserver', 'app-server'):
+                        subagent = False
+                    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_spawn_edges'").fetchone():
+                        if conn.execute('SELECT 1 FROM thread_spawn_edges WHERE child_thread_id=? LIMIT 1', (session,)).fetchone():
+                            subagent = True
+                    result['subagent'] = subagent
                     break
         except sqlite3.Error:
             continue
@@ -228,12 +239,13 @@ def enqueue(cfg, config, home, since, event):
         if not isinstance(value, str) or not value or len(value) > 200 or any(ord(c) < 32 for c in value):
             raise ValueError('completion event requires valid thread-id and turn-id')
     meta = metadata(home, session)
-    if meta['subagent']:
+    if meta['subagent'] is not False:
         return None
     scope = str(Path(config).resolve())
     key = hashlib.sha256((scope + '\0' + session + '\0' + turn).encode()).hexdigest()
     payload = {'session': session, 'turn': turn, 'name': meta['name'],
-               'completed_at': time.time_ns() // 1_000_000, 'goal_completed': False}
+               'completed_at': time.time_ns() // 1_000_000, 'goal_completed': False,
+               'codex_home': str(Path(home).resolve())}
     with database(cfg) as conn:
         conn.execute('BEGIN IMMEDIATE')
         if conn.execute('SELECT 1 FROM jobs WHERE key=?', (key,)).fetchone():
@@ -298,10 +310,16 @@ def worker(config, key):
             return
         with database(cfg) as conn:
             row = conn.execute('SELECT payload,state FROM jobs WHERE key=? AND config=?', (key, str(Path(config).resolve()))).fetchone()
-            if not row or row[1] == 'sent':
+            if not row or row[1] in ('sent', 'suppressed'):
                 return
             payload = json.loads(row[0])
         for attempt in range(2):
+            home = payload.get('codex_home', os.environ.get('CODEX_HOME', str(Path.home()/'.codex')))
+            if metadata(home, payload['session'])['subagent'] is not False:
+                with database(cfg) as conn:
+                    conn.execute("UPDATE jobs SET state='suppressed',error='Main session ownership could not be confirmed' WHERE key=?", (key,))
+                    conn.commit()
+                return
             with database(cfg) as conn:
                 conn.execute("UPDATE jobs SET state='sending',attempts=attempts+1,error=NULL WHERE key=?", (key,))
                 conn.commit()
@@ -501,13 +519,13 @@ def main():
                         if (row.get('type') == 'event_msg' and event.get('type') == 'turn_started') or row.get('type') == 'turn_context':
                             turn = event.get('turn_id') or turn
             meta = metadata(home, session)
-            if meta['subagent']:
+            if meta['subagent'] is not False:
                 return
             turn = turn or str(uuid.uuid4())
             key = hashlib.sha256((str(args.config.resolve()) + '\0' + session + '\0capacity\0' + turn).encode()).hexdigest()
             payload = {'session': session, 'turn': turn, 'name': meta['name'],
                        'completed_at': time.time_ns() // 1_000_000, 'goal_completed': False,
-                       'type': 'model_capacity'}
+                       'type': 'model_capacity', 'codex_home': str(home.resolve())}
             with database(cfg) as conn:
                 conn.execute('INSERT OR IGNORE INTO jobs(key,config,payload,state) VALUES (?,?,?,?)',
                              (key, str(args.config.resolve()), json.dumps(payload, ensure_ascii=False), 'pending'))
@@ -541,7 +559,7 @@ def main():
                     for key, state, attempts, error in conn.execute('SELECT key,state,attempts,error FROM jobs WHERE config=? ORDER BY rowid DESC LIMIT 20', (str(args.config.resolve()),)):
                         print(f'{key[:12]}  {state:8}  attempts={attempts}  {error or ""}')
                 else:
-                    keys = [row[0] for row in conn.execute("SELECT key FROM jobs WHERE state != 'sent' AND config=?", (str(args.config.resolve()),))]
+                    keys = [row[0] for row in conn.execute("SELECT key FROM jobs WHERE state NOT IN ('sent','suppressed') AND config=?", (str(args.config.resolve()),))]
                     for key in keys:
                         worker(args.config, key)
                     print(f'Processed {len(keys)} queued deliveries; run status for results.')

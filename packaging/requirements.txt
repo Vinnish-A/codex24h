@@ -1,3 +1,5 @@
+# Keep the bundled TOML fallback pure Python; compiled wheels hide a mypyc runtime import.
+--no-binary=tomli
 pyinstaller==6.20.0
 pyinstaller-hooks-contrib==2026.7
 tomli==2.4.0

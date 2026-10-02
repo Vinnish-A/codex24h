@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """Read only the rollout owned by this wrapper's child (never guess --last)."""
+import argparse
+import sqlite3
+import uuid
 import json
 import os
 from pathlib import Path
@@ -29,10 +32,6 @@ def process_tree(root):
 
 
 def rollout(root, home):
-    attached = os.environ.get('CODEX24H_TMUX_CLIENT')
-    if attached:
-        socket, _, pane, _ = json.loads(attached)
-        root = int(subprocess.check_output(['tmux', '-S', socket, 'display-message', '-p', '-t', pane, '#{pane_pid}'], timeout=3))
     # Prefer the nearest process owning a session; descendants may be subagents.
     for pid in process_tree(root):
         locks, paths = set(), set()
@@ -92,13 +91,37 @@ def read_session(path):
 
 
 
+def read_shared_session(home, session):
+    session = str(uuid.UUID(session))
+    path = home/'thread_history_1.sqlite'
+    if path.exists():
+        with sqlite3.connect(path.resolve().as_uri()+'?mode=ro', uri=True) as db:
+            rows = db.execute("select item_json from thread_items where thread_id=? and item_type='userMessage' order by rollout_ordinal", (session,)).fetchall()
+        return {'session': session, 'requests': [
+            {'text': '\n'.join(p.get('text', '') for p in json.loads(row[0]).get('content', []) if p.get('type') == 'text')}
+            for row in rows]}
+    for directory in ('sessions', 'archived_sessions'):
+        paths = list((home/directory).glob(f'**/*{session}.jsonl'))
+        if len(paths) == 1:
+            return read_session(paths[0])
+    raise SessionUnavailable('The selected session has no readable request history')
+
+
+
 if __name__ == '__main__':
     try:
+        parser = argparse.ArgumentParser()
+        parser.add_argument('pid', type=int)
+        parser.add_argument('--session')
+        args = parser.parse_args()
         home = Path(os.environ.get('CODEX_HOME', str(Path.home()/'.codex')))
+        if args.session:
+            print(json.dumps(read_shared_session(home, args.session), ensure_ascii=False))
+            sys.exit(0)
         deadline = time.monotonic()+3
         while True:
             try:
-                path = rollout(int(sys.argv[1]), home)
+                path = rollout(args.pid, home)
                 break
             except SessionUnavailable:
                 if time.monotonic() >= deadline:

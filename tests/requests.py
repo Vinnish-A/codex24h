@@ -2,6 +2,7 @@
 import importlib.machinery
 import json
 import os
+import sqlite3
 import time
 import e2e
 from pathlib import Path
@@ -40,4 +41,20 @@ class RequestsTest(unittest.TestCase):
                 self.assertEqual(helper.rollout(os.getpid(),home),ours)
     def test_completed_corrupt_record_reports_error(self):
         with self.assertRaises(json.JSONDecodeError):self.read([], 'bad record\n')
+    def test_shared_history_is_scoped_ordered_and_read_only(self):
+        session='00000000-0000-4000-8000-000000000001'
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp);path=home/'thread_history_1.sqlite'
+            with sqlite3.connect(path) as db:
+                db.execute('create table thread_items(thread_id,item_type,rollout_ordinal,item_json)')
+                db.executemany('insert into thread_items values(?,?,?,?)',[
+                    (session,'userMessage',2,json.dumps({'content':[{'type':'text','text':'second'}]})),
+                    ('other','userMessage',1,json.dumps({'content':[{'type':'text','text':'other'}]})),
+                    (session,'agentMessage',3,json.dumps({'content':[{'type':'text','text':'assistant'}]})),
+                    (session,'userMessage',1,json.dumps({'content':[{'type':'text','text':'first'}]}))])
+            before=path.read_bytes()
+            result=helper.read_shared_session(home,session)
+            self.assertEqual([r['text'] for r in result['requests']],['first','second'])
+            self.assertEqual(path.read_bytes(),before)
+            with self.assertRaises(ValueError):helper.read_shared_session(home,'not-a-uuid')
 if __name__=='__main__':unittest.main()

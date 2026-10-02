@@ -15,6 +15,7 @@ import socketserver
 import sqlite3
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -184,6 +185,94 @@ class MailTests(unittest.TestCase):
             conn.execute('UPDATE threads SET source=?', ('{"subagent":{}}',))
         self.assertIsNone(self.enqueue())
 
+    def test_unknown_or_unreadable_source_never_enqueues(self):
+        for source in (None, '', 'unknown', '{"futureSource":{}}', '{"subAgent":{"thread_spawn":{}}}'):
+            with self.subTest(source=source), sqlite3.connect(self.home/'state_5.sqlite') as conn:
+                conn.execute('UPDATE threads SET source=?', (source,))
+            self.assertIsNone(self.enqueue())
+        with sqlite3.connect(self.home/'state_5.sqlite') as conn:
+            conn.execute("UPDATE threads SET source='cli'")
+        with sqlite3.connect(self.home/'state_5.sqlite') as conn:
+            conn.execute('BEGIN EXCLUSIVE')
+            self.assertIsNone(self.enqueue())
+        with sqlite3.connect(self.home/'state_5.sqlite') as conn:
+            conn.execute('DELETE FROM threads')
+        self.assertIsNone(self.enqueue())
+
+    def test_newest_metadata_does_not_fall_back_to_stale_main_source(self):
+        (self.home/'state_6.sqlite').write_bytes(b'not a SQLite database')
+        self.assertIsNone(self.enqueue())
+
+    def test_spawn_edge_blocks_child_even_with_main_source(self):
+        with sqlite3.connect(self.home/'state_5.sqlite') as conn:
+            conn.execute('CREATE TABLE thread_spawn_edges(parent_thread_id TEXT,child_thread_id TEXT,status TEXT)')
+            conn.execute("INSERT INTO thread_spawn_edges VALUES ('parent','session-1','closed')")
+        self.assertIsNone(self.enqueue())
+
+    def test_unreadable_spawn_relationship_does_not_allow_main_source(self):
+        with sqlite3.connect(self.home/'state_5.sqlite') as conn:
+            conn.execute('CREATE TABLE thread_spawn_edges(future_column TEXT)')
+        self.assertIsNone(self.enqueue())
+
+    def test_queued_delivery_rechecks_child_and_unknown_metadata(self):
+        for source in ('{"subagent":{}}', None):
+            with self.subTest(source=source):
+                with sqlite3.connect(self.home/'state_5.sqlite') as conn:
+                    conn.execute("UPDATE threads SET source='cli'")
+                key = self.enqueue(**{'turn-id':str(source)})
+                with sqlite3.connect(self.home/'state_5.sqlite') as conn:
+                    conn.execute('UPDATE threads SET source=?', (source,))
+                with patch.object(mail, 'deliver') as deliver:
+                    mail.worker(self.config, key)
+                    mail.worker(self.config, key)
+                    deliver.assert_not_called()
+                self.assertEqual(self.job(key)[1:3], ('suppressed', 0))
+
+    def test_shared_child_completion_is_filtered_before_queueing(self):
+        history = self.home/'thread_history_1.sqlite'
+        with sqlite3.connect(history) as conn:
+            conn.execute('CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,status TEXT,completed_at INTEGER)')
+            conn.execute('CREATE TABLE thread_items(thread_id TEXT,item_type TEXT,created_at_ms INTEGER,item_json TEXT)')
+        observer = mail.CompletionWatch(self.home)
+        observer.record({'dir':'from_tui','kind':'op','payload':{'UserTurn':{'client_user_message_id':'child-message'}}})
+        with sqlite3.connect(history) as conn:
+            conn.execute('INSERT INTO thread_items VALUES (?,?,?,?)',
+                         ('session-1','userMessage',observer.since,json.dumps({'clientId':'child-message'})))
+            conn.execute('INSERT INTO thread_turns VALUES (?,?,?,?)',
+                         ('session-1','child-turn','completed',int(time.time())))
+        with sqlite3.connect(self.home/'state_5.sqlite') as conn:
+            conn.execute('UPDATE threads SET source=?', ('{"subagent":{"thread_spawn":{}}}',))
+        events = observer.completed()
+        self.assertEqual(len(events), 1)
+        self.assertIsNone(mail.enqueue(self.cfg,self.config,self.home,observer.since,events[0]))
+
+    def test_capacity_callback_blocks_child_and_missing_metadata(self):
+        rollout = self.home/'rollout-fixture-session-1.jsonl'
+        rollout.write_text(json.dumps({'type':'session_meta','payload':{'id':'session-1'}})+'\n')
+        for source in ('{"subagent":{"thread_spawn":{}}}', None):
+            with sqlite3.connect(self.home/'state_5.sqlite') as conn:
+                conn.execute('UPDATE threads SET source=?', (source,))
+            with rollout.open():
+                subprocess.run([sys.executable,str(SCRIPT),'capacity','--config',str(self.config),'--pid',str(os.getpid())],
+                               env=os.environ|{'CODEX_HOME':str(self.home)},check=True,timeout=5,
+                               stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+        with mail.database(self.cfg) as conn:
+            self.assertEqual(conn.execute('SELECT count(*) FROM jobs').fetchone()[0],0)
+
+    def test_legacy_queued_child_is_blocked_with_inherited_codex_home(self):
+        key = self.enqueue()
+        payload = self.job(key)[0]
+        payload.pop('codex_home')
+        with mail.database(self.cfg) as conn:
+            conn.execute('UPDATE jobs SET payload=? WHERE key=?',(json.dumps(payload),key))
+            conn.commit()
+        with sqlite3.connect(self.home/'state_5.sqlite') as conn:
+            conn.execute('UPDATE threads SET source=?', ('{"subagent":{}}',))
+        with patch.dict(os.environ,{'CODEX_HOME':str(self.home)}), patch.object(mail,'deliver') as deliver:
+            mail.worker(self.config,key)
+            deliver.assert_not_called()
+        self.assertEqual(self.job(key)[1:3], ('suppressed',0))
+
     def test_failure_is_visible_and_retry_deduplicates(self):
         key = self.enqueue()
         with patch.object(mail, 'deliver', side_effect=smtplib.SMTPAuthenticationError(535,b'PRIVATE SECRET')):
@@ -286,6 +375,15 @@ class MailTests(unittest.TestCase):
             env = os.environ | {'SSL_CERT_FILE':str(cert)}
             args = ['python3',str(SCRIPT),'notify','--config',str(self.config),
                     '--codex-home',str(self.home),'--since','100',json.dumps(self.event)]
+            for source in ('{"subagent":{"thread_spawn":{}}}', None):
+                with sqlite3.connect(self.home/'state_5.sqlite') as conn:
+                    conn.execute('UPDATE threads SET source=?', (source,))
+                subprocess.run(args,env=env,check=True,timeout=5)
+            time.sleep(.2)
+            self.assertTrue(server.messages.empty(), 'child or unknown-source callback sent email')
+            self.assertFalse((self.state/'deliveries.sqlite').exists(), 'blocked callbacks created a queue')
+            with sqlite3.connect(self.home/'state_5.sqlite') as conn:
+                conn.execute("UPDATE threads SET source='cli'")
             started = time.monotonic()
             subprocess.run(args,env=env,check=True,timeout=5)
             self.assertLess(time.monotonic()-started,.65,'callback waited for slow SMTP')

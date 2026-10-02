@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Attach an existing tmux terminal without migrating or restarting its process."""
+"""Open a normal Codex24h frontend for a selected shared-backend session."""
 import argparse
 import fcntl
+import hashlib
 import json
+import socket as unix_socket
+import struct
 import os
 from pathlib import Path
+import shlex
 import shutil
-import signal
+import sqlite3
 import subprocess
 import sys
-import tempfile
 
 
 def tmux(socket, *args):
@@ -19,160 +22,202 @@ def tmux(socket, *args):
     return result.stdout.strip()
 
 
-def panes(socket):
-    # Fixed fields only; no titles, shell text or Codex transcript parsing.
-    fields = '#{pane_pid}\t#{pane_id}\t#{pane_tty}\t#{session_id}\t#{window_id}\t#{window_panes}\t#{pane_in_mode}\t#{pane_current_command}\t#{alternate_on}'
-    return [row.split('\t') for row in tmux(socket, 'list-panes', '-a', '-F', fields).splitlines()]
+def tmux_quote(value):
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$') + '"'
 
 
-def cleanup_session(socket, session):
-    # Serialise our detach decisions: two clients must not both see the other
-    # as the last remaining owner and then delete both sessions. flock releases
-    # automatically even if this supervisor is killed during cleanup.
+def trigger_config(wrapper):
+    entry = shutil.which('codex24h')
+    if not entry or Path(entry).resolve() != Path(wrapper).resolve():
+        entry = wrapper
+    shell = shlex.quote(str(entry).replace('#', '##')) + ' attach --popup --socket #{q:socket_path} --client #{q:client_tty} --pane #{q:pane_id}'
+    return '# codex24h: prefix, then h\nbind-key h run-shell -b ' + tmux_quote(shell + ' 2>/dev/null || true') + '\n'
+
+
+def native_process(tty):
+    found = []
+    for process in Path('/proc').iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            if process.stat().st_uid != os.getuid() or str((process/'fd/0').readlink()) != tty:
+                continue
+            exe = (process/'exe').readlink()
+            argv = (process/'cmdline').read_bytes().split(b'\0')
+            if exe.name == 'codex' and b'app-server' not in argv:
+                found.append((process, exe, argv))
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+    if len(found) != 1:
+        raise RuntimeError('目标窗格没有唯一的原生 Codex 前端；不会包裹 shell。')
+    process, exe, argv = found[0]
+    if any(a in (b'--no-daemon', b'--remote', b'-c', b'--config') or a.startswith((b'--remote=', b'--config=', b'-c')) for a in argv[1:]):
+        raise RuntimeError('此入口仅支持本机共享后台模式；不会重启独立会话或连接远程会话。')
+    help_text = subprocess.check_output([str(exe), '--help'], text=True, timeout=10)
+    if '--no-daemon' not in help_text:
+        raise RuntimeError('当前 Codex 版本不支持共享后台重连；请直接启动 codex24h。')
+    env = dict(os.environ)
+    # Match the original installation/home without copying unrelated process secrets.
+    source_env = dict(item.split(b'=', 1) for item in (process/'environ').read_bytes().split(b'\0') if b'=' in item)
+    env.pop('CODEX_HOME', None)
+    if b'CODEX_HOME' in source_env:
+        env['CODEX_HOME'] = os.fsdecode(source_env[b'CODEX_HOME'])
+    env['CODEX24H_CODEX'] = str(exe)
+    env['CODEX24H_RECONNECTED'] = '1'
+    return env, (process/'cwd').readlink()
+
+
+def shared_sessions(home, env=None):
+    """Use the actual local daemon socket peer, never an unrelated app-server."""
+    env = env or os.environ
+    exe = env.get('CODEX24H_CODEX') or shutil.which('codex')
+    version = json.loads(subprocess.check_output([exe, 'app-server', 'daemon', 'version'], env=env, text=True, timeout=10))
+    if version.get('status') != 'running':
+        return set()
+    with unix_socket.socket(unix_socket.AF_UNIX) as connection:
+        connection.settimeout(3)
+        connection.connect(version['socketPath'])
+        pid, uid, _ = struct.unpack('3i', connection.getsockopt(unix_socket.SOL_SOCKET, unix_socket.SO_PEERCRED, 12))
+    if uid != os.getuid():
+        raise RuntimeError('共享后台不属于当前用户。')
+    process = Path(f'/proc/{pid}')
+    if (process/'exe').readlink().name != 'codex' or b'app-server' not in (process/'cmdline').read_bytes().split(b'\0'):
+        raise RuntimeError('无法确认本机共享后台进程。')
+    sessions = set()
+    lock_dir = (home/'thread-writer-locks').resolve()
+    for fd in (process/'fd').iterdir():
+        try:
+            path = fd.readlink()
+            if path.parent != lock_dir or path.suffix != '.lock':
+                continue
+            info = (process/'fdinfo'/fd.name).read_text()
+            if any(line.startswith('lock:') and ' WRITE ' in line and f' {pid} ' in line for line in info.splitlines()):
+                sessions.add(path.stem)
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+    return sessions
+
+
+def session_rows(home, sessions):
+    databases = sorted(home.glob('state_*.sqlite'), key=lambda p: int(p.stem.split('_')[-1]), reverse=True)
+    if not databases or not sessions:
+        return []
+    with sqlite3.connect(databases[0].as_uri()+'?mode=ro', uri=True) as db:
+        columns = {row[1] for row in db.execute('pragma table_info(threads)')}
+        label = "coalesce(nullif(name,''), title)" if 'name' in columns else 'title'
+        rows = db.execute(f'select id, {label}, cwd, source from threads where archived=0 order by updated_at desc').fetchall()
+        tables = {row[0] for row in db.execute("select name from sqlite_master where type='table'")}
+        children = {row[0] for row in db.execute('select child_thread_id from thread_spawn_edges')} if 'thread_spawn_edges' in tables else set()
+    return [row[:3] for row in rows if row[0] in sessions and row[0] not in children and (row[3] or '').strip().strip('"').lower() in {'cli', 'exec', 'vscode', 'appserver', 'app-server'}]
+
+
+def same_directory(a, b):
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return str(a) == str(b)
+
+
+def choose_session(rows, cwd):
+    filtered = [row for row in rows if same_directory(row[2], cwd)]
+    shown = filtered or rows
+    page = 0
+    while True:
+        print('\033[2J\033[Hcodex24h — 选择要重连的会话\n')
+        print('原页面与后台任务保留；原输入草稿不会复制。退出新前端后返回原页面。')
+        print('仅显示共享后台中的主会话。输入编号打开；n/p 翻页；a 显示全部；q 取消。\n')
+        for index, (session, title, directory) in enumerate(shown[page*8:(page+1)*8], page*8+1):
+            safe = lambda s: ''.join(c for c in str(s) if c.isprintable())
+            print(f'{index:>3}. {safe(title)[:80]}\n     {session}  {safe(directory)}')
+        answer = input(f'\n第 {page+1}/{(len(shown)+7)//8} 页 · 编号 / n / p / a / q: ').strip()
+        if answer.lower() == 'q':
+            return None
+        if answer.lower() == 'a':
+            shown = rows
+            page = 0
+        elif answer.lower() == 'n' and (page+1)*8 < len(shown):
+            page += 1
+        elif answer.lower() == 'p' and page:
+            page -= 1
+        elif answer.isdecimal() and 1 <= int(answer) <= len(shown):
+            return shown[int(answer)-1]
+
+
+def reconnect(args, socket):
+    tty = tmux(socket, 'display-message', '-p', '-t', args.pane, '#{pane_tty}')
+    env, cwd = native_process(tty)
+    home = Path(env.get('CODEX_HOME', str(Path.home()/'.codex'))).resolve()
+    rows = session_rows(home, shared_sessions(home, env))
+    if not rows:
+        raise RuntimeError('没有可重连的共享后台主会话；不会启动第二个独立写入者。')
+    selected = choose_session(rows, cwd)
+    if selected is None:
+        return 0
+    session, _, directory = selected
+    if session not in shared_sessions(home, env):
+        raise RuntimeError('所选会话已离开共享后台，请重新打开列表。')
+    # No CLI configuration overrides: these can force a second in-process server.
+    os.chdir(directory)
+    os.execve(args.wrapper, [args.wrapper, 'resume', session], env)
+
+
+def popup(args, socket):
+    clients = dict(row.split('\t', 1) for row in tmux(socket, 'list-clients', '-F', '#{client_tty}\t#{pane_id}').splitlines())
+    if clients.get(args.client) != args.pane:
+        raise RuntimeError('当前窗格已切换，请在目标窗格重新按快捷键。')
+    tty = tmux(socket, 'display-message', '-p', '-t', args.pane, '#{pane_tty}')
+    native_process(tty)  # Refuse shells and unsupported frontends before opening a popup.
     cache = Path(os.environ.get('XDG_CACHE_HOME', str(Path.home()/'.cache')))/'codex24h'
     cache.mkdir(parents=True, exist_ok=True)
-    fd = os.open(cache/'attach-cleanup.lock', os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
-    with os.fdopen(fd, 'w') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        # Another attachment may have been selected as our source. Inspect
-        # actual window references instead of one source session's existence.
-        references = subprocess.run(['tmux', '-S', socket, 'list-windows', '-a', '-F',
-                                     '#{session_id}\t#{window_id}'], capture_output=True, text=True)
-        if references.returncode == 0:
-            windows = [row.split('\t') for row in references.stdout.splitlines()]
-            ours = {window for owner, window in windows if owner == session}
-            shared = {window for owner, window in windows if owner != session}
-            if ours and ours <= shared:
-                subprocess.run(['tmux', '-S', socket, 'kill-session', '-t', session],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            elif ours:
-                print(f'保留连接会话 {session}：其中有窗口已无其他会话承载，以免结束任务。', file=sys.stderr)
+    key = hashlib.sha256((socket+'\0'+args.client).encode()).hexdigest()
+    with (cache/('popup-'+key+'.lock')).open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        command = 'exec ' + shlex.join([args.wrapper, 'attach', '--socket', socket, '--pane', args.pane])
+        return subprocess.call(['tmux', '-S', socket, 'display-popup', '-E', '-w', '100%', '-h', '100%',
+                                '-c', args.client, '-t', args.pane, command])
 
 
 def main():
-    client = os.environ.get('CODEX24H_TMUX_CLIENT')
-    if client:
-        socket, session, pane, terminfo = json.loads(client)
-        env = dict(os.environ, TERM='codex24h-attach', TERMINFO=terminfo)
-        env.pop('TMUX', None)
-        env.pop('CODEX24H_TMUX_CLIENT', None)
-        env.pop('CODEX24H_ATTACH_FULL_SCREEN', None)
-        env.pop('CODEX24H_TMUX_INPUT', None)
-        os.execvpe('tmux', ['tmux', '-S', socket, 'attach-session', '-E', '-f', 'active-pane',
-                           '-t', session, ';', 'select-pane', '-t', pane], env)
-
-    parser = argparse.ArgumentParser(prog='codex24h attach', description=(
-        '实验性：连接已有 tmux 单窗格窗口中的进程，不重启 Codex。Ctrl+] 然后 d 断开。'))
-    parser.add_argument('pid', type=int, nargs='?', help='目标进程 PID（同一窗格的 shell PID 也可）')
-    parser.add_argument('--list', action='store_true', help='列出 tmux 窗格及其起始进程 PID')
-    parser.add_argument('--socket', help='tmux socket 路径；默认当前 TMUX 或默认 server')
+    parser = argparse.ArgumentParser(prog='codex24h attach', description='在 tmux 中选择共享会话，打开正常 codex24h 前端；原页面保留。')
+    parser.add_argument('--socket', help='tmux socket；默认当前 server')
+    parser.add_argument('--tmux-config', action='store_true', help='输出快捷键配置（前缀键，然后 h）')
+    parser.add_argument('--popup', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--client', help=argparse.SUPPRESS)
+    parser.add_argument('--pane', help='目标 tmux pane ID')
     parser.add_argument('--wrapper', required=True, help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if not args.list and (args.pid is None or args.pid <= 0):
-        parser.error('请指定正整数 PID，或使用 --list')
-    if not shutil.which('tmux'):
-        raise RuntimeError('attach 需要 tmux；目前不支持直接迁移普通终端中的进程。')
-    socket = args.socket
-    if not socket:
-        if os.environ.get('TMUX'):
-            socket = os.environ['TMUX'].rsplit(',', 2)[0]
-        else:
-            result = subprocess.run(['tmux', 'display-message', '-p', '#{socket_path}'],
-                                    capture_output=True, text=True)
-            if result.returncode:
-                raise RuntimeError('没有可连接的 tmux server。直接启动的 Codex 暂不能安全接管；不会重启目标进程。')
-            socket = result.stdout.strip()
-    available = panes(socket)
-    if args.list:
-        print('PANE_PID\tPANE\tCOMMAND\tSCREEN')
-        seen = set()
-        for pid, pane, _, _, _, _, _, command, alternate in available:
-            if pane not in seen:
-                print(f'{pid}\t{pane}\t{command}\t'+('full-screen (history limited)' if alternate == '1' else 'inline'))
-                seen.add(pane)
+    if args.tmux_config:
+        print(trigger_config(args.wrapper), end='')
         return 0
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        raise RuntimeError('attach 需要交互终端。请在另一个终端中运行此命令。')
-    process = Path(f'/proc/{args.pid}')
-    if process.stat().st_uid != os.getuid():
-        raise RuntimeError('只能连接当前用户的进程。')
-    tty = os.readlink(process/'fd/0')
-    candidates = [row for row in available if row[2] == tty]
-    if not candidates:
-        raise RuntimeError('目标不在此 tmux server 中。可用 --socket 指定其他 server；普通终端进程暂不支持安全接管。')
-    _, pane, tty, source, window, count, in_mode, command, alternate = candidates[0]
-    if tty == os.ttyname(0):
-        raise RuntimeError('不能从目标自身的终端接入。请在另一个终端或窗格执行 attach。')
-    if count != '1':
-        raise RuntimeError('实验版仅支持单窗格窗口，避免修改已有分屏布局。')
-    if in_mode != '0':
-        raise RuntimeError('目标 tmux 窗格正在复制/选择模式；请先退出该模式再连接。')
-    if command == 'codex24h':
-        raise RuntimeError('目标窗格已经运行 codex24h，无需再次包裹。')
-    if not shutil.which('tic'):
-        raise RuntimeError('attach 需要 tic（通常由 ncurses-bin 提供），用于独立终端能力配置。')
-
-    # tmux normally uses the alternate screen, which has no scrollback. A private
-    # terminfo entry keeps this client on the primary screen, without modifying
-    # the user's tmux server options or Codex's existing terminal environment.
-    with tempfile.TemporaryDirectory(prefix='codex24h-attach-') as directory:
-        source_file = Path(directory)/'terminal.src'
-        source_file.write_text('codex24h-attach|Codex24h attach terminal,\n smcup@, rmcup@, use=xterm-256color,\n')
-        terminfo = str(Path(directory)/'terminfo')
-        result = subprocess.run(['tic', '-x', '-o', terminfo, str(source_file)], capture_output=True, text=True)
-        if result.returncode:
-            raise RuntimeError('无法生成 attach terminfo: '+result.stderr.strip())
-        # Grouped sessions share existing windows, but selection and session
-        # options are independent. No shell or Codex process is started here.
-        session = tmux(socket, 'new-session', '-d', '-P', '-F', '#{session_id}',
-                       '-s', f'codex24h-attach-{os.getpid()}', '-t', source)
-        child = None
-        control = None
+    if not args.pane or (args.popup and not args.client):
+        parser.error('请使用 tmux 快捷键，或指定 --pane；旧 PID 镜像接管入口已移除')
+    socket = args.socket or (os.environ.get('TMUX', '').rsplit(',', 2)[0])
+    if not socket:
+        socket = subprocess.check_output(['tmux', 'display-message', '-p', '#{socket_path}'], text=True).strip()
+    if args.popup:
         try:
-            tmux(socket, 'set-option', '-t', session, 'status', 'off', ';',
-                 'set-option', '-t', session, 'prefix', 'None', ';',
-                 'set-option', '-t', session, 'prefix2', 'None', ';',
-                 'set-option', '-t', session, 'destroy-unattached', 'off', ';',
-                 'select-window', '-t', f'{session}:{window}')
-            env = dict(os.environ, CODEX24H_CODEX=(str(Path(sys.executable).with_name('codex24h-attach')) if getattr(sys, 'frozen', False) else str(Path(__file__).resolve())), CODEX24H_MAIL='0',
-                       CODEX24H_ATTACH_FULL_SCREEN=alternate,
-                       CODEX24H_TMUX_CLIENT=json.dumps([socket, session, pane, terminfo]))
-            # A persistent control connection writes literal bytes to the pane.
-            # The normal tmux client would otherwise reinterpret modified keys
-            # and swallow CSI-u/modifyOtherKeys on older tmux versions.
-            control_env = dict(os.environ)
-            control_env.pop('TMUX', None)
-            control = subprocess.Popen(['tmux', '-S', socket, '-C', 'attach-session', '-E',
-                                        '-f', 'no-output,ignore-size', '-t', session],
-                                       stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                       env=control_env)
-            input_fd = control.stdin.fileno()
-            env['CODEX24H_TMUX_INPUT'] = f'{input_fd}:{pane}'
-            child = subprocess.Popen([args.wrapper], env=env, pass_fds=(input_fd,))
-
-            def forward(signum, _frame):
-                if child.poll() is None:
-                    child.send_signal(signum)
-
-            for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
-                signal.signal(signum, forward)
-            returncode = child.wait()
-            return returncode if returncode >= 0 else 128-returncode
-        finally:
-            if child and child.poll() is None:
-                child.terminate()
-                child.wait(timeout=5)
-            if control:
-                control.stdin.close()
-                if control.poll() is None:
-                    control.terminate()
-                control.wait(timeout=5)
-            cleanup_session(socket, session)
+            return popup(args, socket)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            subprocess.run(['tmux', '-S', socket, 'display-message', '-t', args.pane, 'codex24h: '+str(exc)], capture_output=True)
+            raise
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise RuntimeError('重连需要交互终端。')
+    return reconnect(args, socket)
 
 
 if __name__ == '__main__':
     try:
         sys.exit(main())
-    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+    except (KeyboardInterrupt, EOFError):
+        sys.exit(0)
+    except (OSError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as exc:
         print(f'codex24h attach: {exc}', file=sys.stderr)
+        if sys.stdin.isatty():
+            try:
+                input('按 Enter 返回原页面。')
+            except (EOFError, KeyboardInterrupt):
+                pass
         sys.exit(1)
