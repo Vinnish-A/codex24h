@@ -30,12 +30,29 @@ codex24h resume
 codex24h resume --last
 ```
 
+### Codex 版本兼容
+
+同时维护多个版本的适配。每次启动按当前 `PATH` 查找 `codex`，也可用 `CODEX24H_CODEX=/path/to/codex` 选择已安装版本；切换或升级 Codex 后，下次启动立即使用所选版本，已运行的会话继续使用原进程。wrapper 不固定 Codex 版本，也不自行升级 Codex。
+
+目前验证支持 **0.158.0、0.159.2、0.160.0**：
+
+| Codex CLI | 验证内容 |
+|---|---|
+| 0.158.0 | 恢复会话、`← for agents`、Esc 返回、原生 Tab 补全、完成邮件；独立模式保留 `notify` 路径 |
+| 0.159.2 | 恢复会话、`← for agents`、Esc 返回、原生 Tab 补全、完成邮件 |
+| 0.160.0 | 恢复会话、`← for agents`、Esc 返回、原生 Tab 补全、完成邮件 |
+
+共享模式的上述测试使用 **0.160.0 app-server**。CLI 与后台服务版本可以不同；wrapper 跟随所选 CLI，后台服务由 Codex 管理。旧版后台服务、未列出的 CLI 和其他平台不列为本轮已验证组合，见 [测试记录](TESTING.md)。
+
+适配按实际能力选择：共享模式通过临时事件管道和只读完成元数据发邮件，避免邮件用的 `-c notify=...` 把 Codex 切换为独立写入者；旧版独立模式及显式 `--no-daemon` 保留原生通知。原生支持 agents 时，在空输入框按 **←** 打开任务列表，Esc 返回；该按键保持交给 Codex。
+
 | 操作 | 按键 |
 |---|---|
 | 浏览聊天记录 | 滚轮 / PageUp / PageDown |
 | 返回最新内容 | 浏览时 Ctrl+C，或 Ctrl+] 然后 b |
 | 召回历史输入 | 输入框中的 ↑ / ↓ |
 | 原生补全 | Tab |
+| 原生 agents 列表（共享模式，空输入框） | ←，Esc 返回 |
 | 固定输入区开关 / 调整高度 | Ctrl+] 然后 i / + / - |
 | 搜索历史 | Ctrl+] 然后 / |
 | 当前 session 请求列表 | Ctrl+] 然后 r |

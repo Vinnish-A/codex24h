@@ -19,6 +19,9 @@ import ssl
 import subprocess
 import sys
 import runpy
+import select
+import signal
+import tempfile
 import uuid
 import time
 try:
@@ -349,16 +352,108 @@ def notify(args):
             spawn_worker(args.config, key)
 
 
+class CompletionWatch:
+    """Match only this TUI's user-message IDs; never guess the newest thread."""
+    def __init__(self, home, session=None):
+        self.home = Path(home)
+        self.since = time.time_ns() // 1_000_000
+        self.sessions = set()
+        self.messages = set()
+        self.seen = set()
+        if session:
+            try:
+                self.sessions.add(str(uuid.UUID(session)))
+            except ValueError:
+                for path in self.home.glob('state_*.sqlite'):
+                    with contextlib.closing(sqlite3.connect(path.resolve().as_uri()+'?mode=ro', uri=True)) as conn:
+                        self.sessions.update(row[0] for row in conn.execute(
+                            'SELECT id FROM threads WHERE name=?', (session,)))
+        # A resume must not notify for turns already complete before we launch.
+        try:
+            self.completed(initial=True)
+        except sqlite3.Error:
+            # The daemon may still be creating/migrating its metadata schema.
+            # A notification compatibility issue must not prevent the TUI starting.
+            pass
+
+    def record(self, record):
+        if record.get('dir') != 'from_tui' or record.get('kind') != 'op':
+            return
+        payload = record.get('payload', {})
+        turn = payload.get('UserTurn', {}) if isinstance(payload, dict) else {}
+        message = turn.get('client_user_message_id')
+        if message:
+            self.messages.add(message)
+
+    def completed(self, initial=False):
+        path = self.home/'thread_history_1.sqlite'
+        if not path.exists():
+            return []
+        found = []
+        with contextlib.closing(sqlite3.connect(path.resolve().as_uri()+'?mode=ro', uri=True, timeout=.5)) as conn:
+            for message in list(self.messages):
+                row = conn.execute(
+                    "SELECT thread_id FROM thread_items WHERE item_type='userMessage' AND created_at_ms>=? AND json_extract(item_json,'$.clientId')=?",
+                    (self.since, message)).fetchone()
+                if row:
+                    self.sessions.add(row[0])
+                    self.messages.remove(message)
+            for session in self.sessions:
+                for turn, completed in conn.execute(
+                    "SELECT turn_id,completed_at FROM thread_turns WHERE thread_id=? AND status='completed' AND completed_at>=?",
+                    (session, self.since//1000)):
+                    key = (session, turn)
+                    if key not in self.seen:
+                        self.seen.add(key)
+                        if not initial:
+                            found.append({'type': 'agent-turn-complete', 'thread-id': session, 'turn-id': turn})
+        return found
+
+
+def watch(args):
+    cfg = load_config(args.config)
+    password(cfg)
+    observer = CompletionWatch(args.codex_home, args.session)
+    # The recording is a pipe, never a chat log on disk. SMTP stays in workers.
+    with tempfile.TemporaryDirectory(prefix='codex24h-mail-') as directory:
+        path = Path(directory)/'events'
+        os.mkfifo(path, 0o600)
+        fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            print(path, flush=True)
+            pending = b''
+            reported = False
+            while True:
+                if select.select([fd], [], [], .25)[0]:
+                    pending += os.read(fd, 65536)
+                    while b'\n' in pending:
+                        line, pending = pending.split(b'\n', 1)
+                        observer.record(json.loads(line))
+                try:
+                    events = observer.completed()
+                except sqlite3.Error:
+                    if not reported:
+                        print('codex24h-mail: completion metadata is unavailable; TUI connection is unchanged', file=sys.stderr)
+                        reported = True
+                    continue
+                for event in events:
+                    key = enqueue(cfg, args.config, args.codex_home, observer.since, event)
+                    if key:
+                        spawn_worker(args.config, key)
+        finally:
+            os.close(fd)
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest='command', required=True)
-    for name in ('prepare', 'notify', 'worker', 'test', 'status', 'retry', 'set-password', 'capacity'):
+    for name in ('prepare', 'notify', 'worker', 'test', 'status', 'retry', 'set-password', 'capacity', 'watch'):
         sub = subs.add_parser(name)
         sub.add_argument('--config', type=Path, default=config_path())
         if name == 'capacity':
             sub.add_argument('--pid', type=int, required=True)
-        if name in ('prepare', 'notify'):
+        if name in ('prepare', 'notify', 'watch'):
             sub.add_argument('--codex-home', type=Path, default=Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')))
         if name == 'prepare':
             sub.add_argument('args', nargs=argparse.REMAINDER)
@@ -366,6 +461,8 @@ def main():
             sub.add_argument('--since', type=int, required=True)
             sub.add_argument('--previous', default='[]')
             sub.add_argument('event')
+        if name == 'watch':
+            sub.add_argument('--session')
         if name == 'worker':
             sub.add_argument('key')
     args = parser.parse_args()
@@ -377,6 +474,9 @@ def main():
         notify(args)
     elif args.command == 'worker':
         worker(args.config, args.key)
+    elif args.command == 'watch':
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        watch(args)
     else:
         if args.command == 'capacity' and not args.config.is_file():
             return

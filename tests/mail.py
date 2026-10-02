@@ -140,6 +140,44 @@ class MailTests(unittest.TestCase):
             conn.execute('INSERT INTO thread_goals VALUES (?,?,?,?)', ('session-1','old','complete',99))
         self.assertFalse(self.job(self.enqueue())[0]['goal_completed'])
 
+    def test_shared_watch_scopes_completion_to_tui_message_and_deduplicates(self):
+        history = self.home/'thread_history_1.sqlite'
+        with sqlite3.connect(history) as conn:
+            conn.execute('CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,first_user_item_id TEXT,status TEXT,completed_at INTEGER)')
+            conn.execute('CREATE TABLE thread_items(thread_id TEXT,item_type TEXT,created_at_ms INTEGER,item_json TEXT)')
+            conn.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)',
+                         ('other-session','other-turn','other-message','completed',int(time.time())))
+        observer = mail.CompletionWatch(self.home)
+        observer.record({'dir':'from_tui','kind':'op','payload':{'UserTurn':{
+            'client_user_message_id':'my-message','items':[{'text':'PRIVATE PROMPT'}]}}})
+        self.assertEqual(observer.completed(), [])
+        with sqlite3.connect(history) as conn:
+            conn.execute('INSERT INTO thread_items VALUES (?,?,?,?)',
+                         ('session-1','userMessage',int(time.time()*1000),json.dumps({'clientId':'my-message','content':'PRIVATE PROMPT'})))
+            conn.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)',
+                         ('session-1','turn-1','my-message','completed',int(time.time())))
+            conn.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)',
+                         ('session-1','aborted','my-aborted','interrupted',int(time.time())))
+        self.assertEqual(observer.completed(), [
+            {'type':'agent-turn-complete','thread-id':'session-1','turn-id':'turn-1'}])
+        self.assertEqual(observer.completed(), [])
+
+    def test_shared_resume_ignores_completed_history_but_watches_active_turn(self):
+        session = '11111111-1111-4111-8111-111111111111'
+        history = self.home/'thread_history_1.sqlite'
+        with sqlite3.connect(history) as conn:
+            conn.execute('CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,first_user_item_id TEXT,status TEXT,completed_at INTEGER)')
+            conn.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)',
+                         (session,'old','old-message','completed',int(time.time())))
+            conn.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)',
+                         (session,'active','new-message','inProgress',None))
+        observer = mail.CompletionWatch(self.home, session)
+        self.assertEqual(observer.completed(), [])
+        with sqlite3.connect(history) as conn:
+            conn.execute("UPDATE thread_turns SET status='completed',completed_at=? WHERE turn_id='active'", (int(time.time()),))
+        self.assertEqual(observer.completed(), [
+            {'type':'agent-turn-complete','thread-id':session,'turn-id':'active'}])
+
     def test_no_email_for_interrupt_or_subagent(self):
         self.assertIsNone(self.enqueue(type='turn-aborted'))
         with sqlite3.connect(self.home / 'state_5.sqlite') as conn:

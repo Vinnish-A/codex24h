@@ -772,7 +772,7 @@ mod tests {
         }
         let mut router = Router::new();
         router.set_mode(InputMode::Browse);
-        let keys = b"\x1b[A\x1b[B\ttext\x1b[200~\x03\x1b[201~";
+        let keys = b"\x1b[A\x1b[B\x1b[D\x1bOD\x1b[57350u\ttext\x1b[200~\x03\x1b[201~";
         assert_eq!(router.feed(keys), vec![Action::Forward(keys.to_vec())]);
     }
     #[test]

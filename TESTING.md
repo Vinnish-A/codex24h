@@ -1,5 +1,31 @@
 # 本机验证记录
 
+## 2026-10-02：多版本恢复、共享写入与 agents
+
+环境：Linux / WSL，原生 Codex CLI 0.158.0、0.159.2、0.160.0；共享 app-server 0.160.0。通过独立测试窗格和临时 tmux server 验证，原 `omni` 窗格保持不动。已有用户会话只恢复、浏览和测试补全，不提交模型请求；真实邮件用新建测试会话和本地 TLS SMTP 接收器。
+
+根因对照：普通 `codex resume`、原生 `--no-alt-screen` 和 `CODEX24H_MAIL=0 codex24h resume` 均成功恢复同一会话。仅添加 `-c notify=[]` 或 `-c model=...`，即复现 `This conversation is open in another app`；数据库日志显示请求从 `unix_socket` 变为 `in-process`，随后报 `thread-store conflict ... already has an active writer`。邮件 wrapper 原先正是通过 `-c notify=...` 加入回调。显式 `--remote unix://` 可恢复，但 agents 入口和通知行为不同，未采用该方案。
+
+另做缺少代理环境的对照：共享客户端仍能使用已有服务，独立路径在 `account/read` 阶段出现 `workspace routing discovery timed out`。为测试进程补齐相同代理后，独立路径显示写入竞争；该网络问题与写入冲突分开记录。
+
+- 三个 CLI 版本分别恢复同一已有会话：原生 **← for agents** 打开列表、Esc 返回、`/mo` + Tab 补全通过。邮件开启时不再加入配置覆盖，不启动独立写入者。
+- 三个 CLI 版本分别创建新测试任务：完成后收到本地 TLS SMTP 邮件；队列包含实际 session/turn ID，除原生会话名外不包含请求或回答正文。
+- Codex 0.158.0 显式 `--no-daemon`：原生补全和实际完成邮件通过，继续使用 `notify` 旧路径；独立模式不显示共享 agents 入口。
+- `python3 tests/compatibility.py`：模拟 `PATH/codex` 从旧版链接切到新版，新启动立即使用新版，旧进程仍存活；显式 `CODEX24H_CODEX` 优先于 PATH。
+- `cargo test --locked`：63 项通过，包括传统、应用光标及 Kitty ← 编码透传；`python3 tests/e2e.py`：13 项通过；`python3 tests/mail.py`：14 项通过，包括通知归属、去重、恢复不重复通知历史、忽略中断及其他会话。
+- 事件流为权限 0600 的临时 FIFO；退出后观察器和目录清理。Codex 可执行文件每次重新解析，能力检测使用当前 CLI 的帮助输出；无版本固定或持久版本缓存。
+
+复现（CLI 路径自行替换；共享测试可指定已有闲置 UUID）：
+
+```bash
+python3 tests/native_compat.py --codex /path/to/codex --session SESSION_UUID
+python3 tests/native_compat.py --codex /path/to/codex --mail
+python3 tests/native_compat.py --codex /path/to/codex --no-daemon --mail
+python3 tests/compatibility.py
+```
+
+`--mail` 会创建测试任务并产生模型请求。上述旧 CLI 的共享测试均连接 0.160.0 后台服务，不声称已经覆盖所有旧后台服务组合。共享通知需要当前的 TUI 请求 clientId 和 `thread_history_1.sqlite` 完成元数据；完整 UUID 恢复可跟踪已经运行的轮次，picker / `--last` / agents 只接入旧轮次时的通知，以及退出 TUI 后的后台通知不在本轮保证范围。旧式请求列表和 `session` 的内核锁查询仍有原来的适用范围，不将其视为所有 thread-store 会话的占用证明。
+
 2026-09-28，Linux / WSL，本机 Codex CLI 0.156.1，使用已有认证。
 
 - `cargo test --locked`：41 项通过，覆盖输入协议、冻结视图、历史搜索/复制、终端绘制与启动参数。

@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
+import stat
 import sys
 import threading
 import time
@@ -39,6 +41,43 @@ try:
             assert 'PRIVATE' not in msg.get_content()
             subprocess.run(args, env=env, check=True, timeout=5)
             assert server.messages.empty(), 'duplicate completion delivery'
+            # The new shared-mode adapter must also work inside the bundled runtime.
+            session = '11111111-1111-4111-8111-111111111111'
+            with sqlite3.connect(case.home/'state_5.sqlite') as conn:
+                conn.execute('INSERT INTO threads VALUES (?,?,?,?)', (session, '共享模式测试', 'test', 'cli'))
+            with sqlite3.connect(case.home/'thread_history_1.sqlite') as conn:
+                conn.execute('CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,status TEXT,completed_at INTEGER)')
+                conn.execute('CREATE TABLE thread_items(thread_id TEXT,item_type TEXT,created_at_ms INTEGER,item_json TEXT)')
+            watcher = subprocess.Popen([helper, 'watch', '--config', str(case.config), '--codex-home', str(case.home)],
+                                       env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            pipe = None
+            try:
+                pipe = Path(watcher.stdout.readline().strip())
+                assert stat.S_ISFIFO(pipe.stat().st_mode), 'event recording must be a FIFO'
+                with sqlite3.connect(case.home/'thread_history_1.sqlite') as conn:
+                    conn.execute('INSERT INTO thread_items VALUES (?,?,?,?)',
+                                 (session, 'userMessage', int(time.time()*1000), json.dumps({'clientId':'bundle-message'})))
+                    conn.execute('INSERT INTO thread_turns VALUES (?,?,?,?)',
+                                 (session, 'bundle-turn', 'completed', int(time.time())))
+                event = {'dir':'from_tui', 'kind':'op', 'payload':{'UserTurn':{
+                    'client_user_message_id':'bundle-message', 'items':[{'text':'PRIVATE PROMPT'}]}}}
+                with pipe.open('w') as stream:
+                    stream.write(json.dumps(event)+'\n')
+                msg = BytesParser(policy=policy.default).parsebytes(server.messages.get(timeout=8))
+                assert session in msg.get_content()
+                assert '共享模式测试' in str(msg['Subject'])
+                assert 'PRIVATE' not in msg.get_content()
+                with pipe.open('w') as stream:
+                    stream.write(json.dumps(event)+'\n')
+                time.sleep(.5)
+                assert server.messages.empty(), 'duplicate shared completion delivery'
+            finally:
+                watcher.terminate()
+                watcher.wait(timeout=5)
+                watcher.stdout.close()
+                watcher.stderr.close()
+                if pipe is not None:
+                    assert not pipe.exists(), 'watcher event pipe was not cleaned up'
             rollout = case.home / 'rollout-fixture-session-1.jsonl'
             rollout.write_text(json.dumps({'type': 'session_meta', 'payload': {'id': 'session-1'}}) + '\n' +
                                json.dumps({'type': 'event_msg', 'payload': {'type': 'turn_started', 'turn_id': 'turn-capacity'}}) + '\n')
@@ -97,7 +136,7 @@ for line in sys.stdin:
                 terminal.send(b'exit\r'); terminal.process.wait(timeout=5)
             finally:
                 terminal.close()
-            print('PASS bundled runtime without Python on PATH: helpers, async SMTP, deduplication, native capacity mail and next turn')
+            print('PASS bundled runtime without Python on PATH: helpers, async SMTP, shared watcher, FIFO cleanup, deduplication, native capacity mail and next turn')
         finally:
             server.shutdown()
 finally:

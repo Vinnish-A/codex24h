@@ -2,7 +2,7 @@
 
 直接承载本机原版 Codex 的轻量 PTY wrapper。上滚后冻结阅读画面，Codex 在后台继续运行；回到底部恢复跟随。输入框、slash commands、模型、approval、diff、MCP 和会话恢复仍由原版 Codex 提供。
 
-不调用 app-server API，不复制认证，不更改 Codex 全局配置，也不创建容器或虚拟机。原版 Codex 自己是否使用后台 daemon，仍由它的参数和设置决定。
+不调用 app-server API，不复制认证，不更改 Codex 全局配置，也不创建容器或虚拟机。原版 Codex 自己是否使用后台 daemon，仍由它的参数和设置决定。每次启动重新解析当前 Codex 可执行文件；多版本验证范围见 [README](../README.md#codex-版本兼容)。
 
 ## 安装与使用
 
@@ -81,6 +81,10 @@ Wrapper 选项通过环境变量设置，避免与 Codex 参数重名。
 历史空间随列宽增长。本机构建的基础单元格为 24 字节，120 列 × 10000 行仅单元格主体约 27.5 MiB；100000 行约 275 MiB，附加 Unicode/样式和快照另计。不记录 PTY 原始数据，不导出终端历史到服务器文件。
 
 `resume` 由 Codex 直接处理。Wrapper 的历史仅包含本次收到并保留的终端内容；Codex 未输出的旧会话内容不会自动补齐。原位覆盖的每一帧也不会被无限追加成“聊天记录”。
+
+共享服务模式保留原生 **← for agents**：空输入框按 ← 打开任务列表，Esc 返回。wrapper 不强制 `--remote` 或 `--no-daemon`，也不为了安装邮件通知添加会切换写入方式的配置覆盖。
+
+共享模式的邮件观察器使用 Codex TUI 的临时 FIFO 事件流，通过用户请求的 `clientId` 只读匹配 `thread_history_1.sqlite` 中的完成状态；请求和回答不写入管道以外的聊天日志，也不进入邮件队列。完整 UUID 的 `resume` 还会观察已在运行的轮次，已完成历史不会重新通知。通过 picker、`--last` 或 agents 列表接入一个已经运行的轮次时，提交过本次 TUI 的请求后才能建立通知归属；仅接入旧任务不保证完成通知。该观察器随 wrapper 退出而关闭，脱离 TUI 后的后台完成不在此观察范围内。旧式独立模式与显式 `--no-daemon` 继续使用原生 `notify`。
 
 ## 实现与验证
 

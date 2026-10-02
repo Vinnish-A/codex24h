@@ -79,9 +79,10 @@ fn run() -> Result<i32> {
     let attached = env::var_os("CODEX24H_TMUX_CLIENT").is_some();
     let attached_full_screen = env::var_os("CODEX24H_ATTACH_FULL_SCREEN").is_some_and(|v| v == "1");
     let mut tmux_input = codex24h::tmux_input::TmuxInput::from_env()?;
-    let args = codex24h::mail::arguments(args)?;
     let exe = launch::resolve_codex()?;
-    if !terminal::is_tty(0) || !terminal::is_tty(1) || !launch::interactive(&args) {
+    let pty = terminal::is_tty(0) && terminal::is_tty(1) && launch::interactive(&args);
+    let (args, mail_watcher) = codex24h::mail::arguments(args, &exe, pty)?;
+    if !pty {
         return Err(Command::new(exe).args(args).exec().into());
     }
     let history = number("CODEX24H_HISTORY", 10_000, 1, 1_000_000)?;
@@ -95,6 +96,10 @@ fn run() -> Result<i32> {
     cmd.args(launch::wrapped_args(&args));
     cmd.cwd(env::current_dir()?);
     cmd.env("TERM", "xterm-256color");
+    if let Some(watcher) = &mail_watcher {
+        cmd.env("CODEX_TUI_RECORD_SESSION", "1");
+        cmd.env("CODEX_TUI_SESSION_LOG_PATH", &watcher.path);
+    }
     let fd = pair
         .master
         .as_raw_fd()

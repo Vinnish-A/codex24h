@@ -189,6 +189,39 @@ fn takes_value(arg: &OsStr) -> bool {
     )
 }
 
+pub fn has_option(args: &[OsString], option: &str) -> bool {
+    let mut index = 0;
+    while index < args.len() && args[index] != "--" {
+        let arg = args[index].to_string_lossy();
+        if arg == option || arg.starts_with(&format!("{option}=")) {
+            return true;
+        }
+        index += if takes_value(&args[index]) { 2 } else { 1 };
+    }
+    false
+}
+
+pub fn resume_target(args: &[OsString]) -> Option<&OsStr> {
+    let mut index = 0;
+    while index < args.len() && args[index] != "--" {
+        if args[index] == "resume" {
+            index += 1;
+            while index < args.len() && args[index] != "--" {
+                if !args[index].to_string_lossy().starts_with('-') {
+                    return Some(&args[index]);
+                }
+                index += if takes_value(&args[index]) { 2 } else { 1 };
+            }
+            return None;
+        }
+        if !args[index].to_string_lossy().starts_with('-') {
+            return None;
+        }
+        index += if takes_value(&args[index]) { 2 } else { 1 };
+    }
+    None
+}
+
 fn has_attached_value(arg: &OsStr) -> bool {
     let Some(value) = arg.to_str() else {
         return false;
@@ -280,7 +313,7 @@ pub fn wrapped_args(args: &[OsString]) -> Vec<OsString> {
 
 #[cfg(test)]
 mod tests {
-    use super::{interactive, wrapped_args};
+    use super::{has_option, interactive, resume_target, wrapped_args};
     use std::ffi::OsString;
 
     fn args(values: &[&str]) -> Vec<OsString> {
@@ -334,6 +367,27 @@ mod tests {
             wrapped_args(&args(&["exec", "--json"])),
             args(&["exec", "--json"])
         );
+    }
+
+    #[test]
+    fn distinguishes_connection_flags_from_config_values_and_prompts() {
+        assert!(has_option(
+            &args(&["resume", "id", "--no-daemon"]),
+            "--no-daemon"
+        ));
+        assert!(has_option(
+            &args(&["--remote=unix://", "resume"]),
+            "--remote"
+        ));
+        assert!(!has_option(
+            &args(&["-c", "--no-daemon", "resume"]),
+            "--no-daemon"
+        ));
+        assert!(!has_option(&args(&["--", "--remote=unix://"]), "--remote"));
+        let input = args(&["-C", "resume", "resume", "-c", "model=foo", "id"]);
+        assert_eq!(resume_target(&input), Some(std::ffi::OsStr::new("id")));
+        assert_eq!(resume_target(&args(&["resume", "--last"])), None);
+        assert_eq!(resume_target(&args(&["--", "resume", "id"])), None);
     }
 
     #[cfg(unix)]
