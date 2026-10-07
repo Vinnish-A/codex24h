@@ -57,4 +57,30 @@ class RequestsTest(unittest.TestCase):
             self.assertEqual([r['text'] for r in result['requests']],['first','second'])
             self.assertEqual(path.read_bytes(),before)
             with self.assertRaises(ValueError):helper.read_shared_session(home,'not-a-uuid')
+    def test_selected_session_falls_back_to_its_rollout_when_projection_is_unavailable(self):
+        session='00000000-0000-4000-8000-000000000001'
+        for projection in ('missing','empty','unreadable'):
+            for directory in ('sessions','archived_sessions'):
+                with self.subTest(projection=projection,directory=directory), tempfile.TemporaryDirectory() as tmp:
+                    home=Path(tmp);path=home/'thread_history_1.sqlite'
+                    if projection=='empty':
+                        with sqlite3.connect(path) as db:
+                            db.execute('create table thread_items(thread_id,item_type,rollout_ordinal,item_json)')
+                            db.execute('insert into thread_items values(?,?,?,?)',('other','userMessage',1,'{}'))
+                    elif projection=='unreadable':
+                        path.write_bytes(b'not a SQLite database')
+                    before=path.read_bytes() if path.exists() else None
+                    folder=home/directory/'2026'/'10'/'07';folder.mkdir(parents=True)
+                    record={'type':'event_msg','payload':{'type':'user_message','message':'selected request'}}
+                    (folder/f'rollout-fixture-{session}.jsonl').write_text(json.dumps(record)+'\n')
+                    result=helper.read_shared_session(home,session)
+                    self.assertEqual([r['text'] for r in result['requests']],['selected request'])
+                    self.assertEqual(path.read_bytes() if path.exists() else None,before)
+    def test_empty_shared_history_without_rollout_remains_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp)
+            with sqlite3.connect(home/'thread_history_1.sqlite') as db:
+                db.execute('create table thread_items(thread_id,item_type,rollout_ordinal,item_json)')
+            result=helper.read_shared_session(home,'00000000-0000-4000-8000-000000000001')
+            self.assertEqual(result['requests'],[])
 if __name__=='__main__':unittest.main()

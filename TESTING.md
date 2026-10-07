@@ -1,5 +1,25 @@
 # 本机验证记录
 
+## 2026-10-07：普通指定 UUID 的 resume 请求检索
+
+环境：Linux / WSL，Codex CLI 0.160.0、共享 app-server 0.160.0；使用已有的已完成测试会话，4 条用户请求。测试只恢复、浏览和退出前端，不提交模型任务。
+
+- 修复前的安装版 0.2.2：`codex24h resume SESSION_UUID` 恢复完成后，`Ctrl+] r` 显示 0 条，并提示 `Current session record is not available yet`；关闭重开仍失败。进入列表前没有处于 frozen。普通 resume 选择器也复现空列表。
+- 根因：主程序仅在重连入口传入目标会话 UUID；普通 resume 仍依赖前端进程持有 rollout。共享后台负责记录历史时，这个前提不成立。旧真实请求导航测试强制使用独立模式，未覆盖默认共享恢复。
+- 修复后：显式 UUID 普通恢复直接读取目标共享历史，缺少请求或共享数据库不可读时读取该 UUID 的 session 日志。Rust 63 项、PTY 14 项、请求提取 7 项全部通过；新增 PTY 回归使用无 rollout 的前端和多会话数据库，验证只列出目标会话、顺序正确、读取不写数据库、原生参数不变。
+- `tests/native_resume_requests.py` 在源码 debug 版及包含修复 helper 的本机 release 包中均通过：4/4 请求在对话正文定位，排除 Find 输入框及固定输入区的假命中，每次返回实时界面；结束时用户请求保持 4 条。本机 `codex24h` 已切换到本地修复包，安装后的新增 PTY 回归通过。
+- 安装后的 `tests/native_requests_compacted.py --draft --size 160x40 ROLLOUT_FILE` 使用临时会话副本复测独立模式，4/4 请求定位、滚轮和翻页往返、一次 Ctrl+C 返回及草稿保留通过，没有新增模型请求。
+- 修复仅覆盖启动时明确指定的会话 UUID；不宣称普通选择器、`--last` 或恢复后 agents / `/new` 切换会自动绑定当前线程。测试会话正文未加入仓库。
+
+复现（选择已有的已完成测试会话 UUID）：
+
+```bash
+python3 tests/native_resume_requests.py --binary "$HOME/.local/bin/codex24h" SESSION_UUID
+python3 tests/requests.py
+python3 tests/e2e.py
+cargo test --locked
+```
+
 ## 2026-10-02：多版本恢复、共享写入与 agents
 
 环境：Linux / WSL，原生 Codex CLI 0.158.0、0.159.2、0.160.0；共享 app-server 0.160.0。通过独立测试窗格和临时 tmux server 验证，原 `omni` 窗格保持不动。已有用户会话只恢复、浏览和测试补全，不提交模型请求；真实邮件用新建测试会话和本地 TLS SMTP 接收器。

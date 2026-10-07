@@ -114,10 +114,8 @@ fn run() -> Result<i32> {
         core.pin_rows = pin_rows;
         core.reconnected = reconnected;
         core.requests.pid = child.process_id();
-        if reconnected {
-            core.requests.session =
-                launch::resume_target(&args).map(|s| s.to_string_lossy().into_owned());
-        }
+        core.requests.session =
+            launch::resume_target(&args).map(|s| s.to_string_lossy().into_owned());
         let mut router = Router::new();
         router.set_detachable(reconnected);
         let mut renderer = Renderer::new();

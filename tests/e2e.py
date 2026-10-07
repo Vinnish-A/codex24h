@@ -9,6 +9,7 @@ import pty
 import re
 import select
 import signal
+import sqlite3
 import struct
 import subprocess
 import tempfile
@@ -233,6 +234,38 @@ class WrapperE2E(unittest.TestCase):
     def child_pid(self):
         self.wait_log("pid.log", b"\n")
         return int(self.log("pid.log").splitlines()[-1])
+
+    def test_resume_requests_read_selected_shared_session_without_child_rollout(self):
+        session = "00000000-0000-4000-8000-000000000001"
+        home = Path(self.temp.name, "codex-home")
+        home.mkdir()
+        path = home / "thread_history_1.sqlite"
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE thread_items(thread_id,item_type,rollout_ordinal,item_json)")
+            db.executemany("INSERT INTO thread_items VALUES (?,?,?,?)", [
+                (session, "userMessage", 2, json.dumps({"content": [{"type": "text", "text": "RESUME-SECOND"}]})),
+                ("other", "userMessage", 1, json.dumps({"content": [{"type": "text", "text": "OTHER-SESSION"}]})),
+                (session, "userMessage", 1, json.dumps({"content": [{"type": "text", "text": "RESUME-FIRST"}]})),
+            ])
+        before = path.read_bytes()
+        terminal = Terminal(self.env | {"CODEX_HOME": str(home)}, ["resume", session])
+        self.addCleanup(terminal.close)
+        terminal.until("READY-080")
+        terminal.send(b"\x1dr")
+        terminal.until("RESUME-SECOND")
+        terminal.drain(.2)
+        view = "\n".join(screen_text(terminal.output))
+        self.assertIn("Requests (2)", view)
+        self.assertIn("RESUME-FIRST", view)
+        self.assertIn("RESUME-SECOND", view)
+        self.assertLess(view.index("RESUME-FIRST"), view.index("RESUME-SECOND"))
+        self.assertNotIn("OTHER-SESSION", view)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(json.loads(self.log("argv.json")), ["--no-alt-screen", "resume", session])
+        terminal.send(b"\x1b")
+        terminal.drain(.2)
+        terminal.send(b":exit 0\n")
+        self.assertEqual(terminal.wait_draining(), 0)
 
     def assert_child_gone(self, pid):
         end = time.monotonic() + 3
