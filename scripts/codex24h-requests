@@ -116,6 +116,26 @@ def read_shared_session(home, session):
     raise SessionUnavailable('The selected session has no readable request history')
 
 
+def resolve_session(home, target):
+    try:
+        return str(uuid.UUID(target))
+    except ValueError:
+        if not (8 <= len(target) < 36 and all(
+                c == '-' if i in (8, 13, 18, 23) else c in '0123456789abcdefABCDEF'
+                for i, c in enumerate(target))):
+            raise
+    # The native picker can clip its UUID field in a narrow terminal. Resolve
+    # only that explicit prefix, and refuse ambiguity rather than choosing latest.
+    matches = set()
+    for path in home.glob('state_*.sqlite'):
+        with sqlite3.connect(path.resolve().as_uri()+'?mode=ro', uri=True) as db:
+            matches.update(row[0] for row in db.execute(
+                'select id from threads where id like ?', (target+'%',)))
+    if len(matches) != 1:
+        raise SessionUnavailable('Current session UUID is clipped or ambiguous; widen the terminal and select it again')
+    return str(uuid.UUID(matches.pop()))
+
+
 
 if __name__ == '__main__':
     try:
@@ -126,7 +146,7 @@ if __name__ == '__main__':
         home = Path(os.environ.get('CODEX_HOME', str(Path.home()/'.codex')))
         if args.session:
             try:
-                uuid.UUID(args.session)
+                args.session = resolve_session(home, args.session)
             except ValueError:
                 # Named resumes retain the process-owned rollout path.
                 args.session = None

@@ -83,4 +83,16 @@ class RequestsTest(unittest.TestCase):
                 db.execute('create table thread_items(thread_id,item_type,rollout_ordinal,item_json)')
             result=helper.read_shared_session(home,'00000000-0000-4000-8000-000000000001')
             self.assertEqual(result['requests'],[])
+    def test_clipped_native_uuid_resolves_only_a_unique_prefix(self):
+        first='00000000-0000-4000-8000-111111111111'
+        second='00000000-0000-4000-8000-222222222222'
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp)
+            with sqlite3.connect(home/'state_5.sqlite') as db:
+                db.execute('create table threads(id text)')
+                db.executemany('insert into threads values(?)',[(first,),(second,)])
+            self.assertEqual(helper.resolve_session(home,first[:30]),first)
+            self.assertEqual(helper.resolve_session(home,second),second)
+            with self.assertRaises(helper.SessionUnavailable):helper.resolve_session(home,first[:24])
+            with self.assertRaises(helper.SessionUnavailable):helper.resolve_session(home,'deadbeef')
 if __name__=='__main__':unittest.main()

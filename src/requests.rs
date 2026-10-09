@@ -17,12 +17,16 @@ use unicode_width::UnicodeWidthChar;
 pub struct Requests {
     pub pid: Option<u32>,
     pub session: Option<String>,
-    pending: Option<Receiver<Result<Vec<String>, String>>>,
+    pending: Option<Receiver<Result<RequestList, String>>>,
     pub texts: Vec<String>,
     pub locations: Vec<Option<usize>>,
     selected: usize,
     filter: String,
     pub message: String,
+}
+struct RequestList {
+    session: Option<String>,
+    texts: Vec<String>,
 }
 pub enum Choice {
     Stay,
@@ -30,6 +34,15 @@ pub enum Choice {
     Jump(usize),
 }
 impl Requests {
+    pub fn bind_session(&mut self, session: Option<String>) {
+        if self.session != session {
+            self.session = session;
+            self.pending = None;
+            self.texts.clear();
+            self.locations.clear();
+            self.message.clear();
+        }
+    }
     pub fn open(&mut self) {
         self.filter.clear();
         self.selected = 0;
@@ -68,12 +81,18 @@ impl Requests {
                 if let Some(error) = v["error"].as_str() {
                     return Err(error.into());
                 }
-                Ok(v["requests"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|r| r["text"].as_str().map(str::to_owned))
-                    .collect())
+                Ok(RequestList {
+                    session: v["session"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned),
+                    texts: v["requests"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|r| r["text"].as_str().map(str::to_owned))
+                        .collect(),
+                })
             })();
             let _ = tx.send(result);
         });
@@ -84,8 +103,11 @@ impl Requests {
         };
         self.pending = None;
         match result {
-            Ok(texts) => {
-                self.texts = texts;
+            Ok(list) => {
+                if list.session.is_some() {
+                    self.session = list.session;
+                }
+                self.texts = list.texts;
                 self.selected = if self.filter.is_empty() {
                     self.texts.len().saturating_sub(1)
                 } else {

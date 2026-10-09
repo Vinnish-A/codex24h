@@ -66,7 +66,7 @@ codex24h resume --last
 
 按 **Ctrl+] 然后 r** 打开当前会话的请求列表，↑↓ 选择，输入关键词筛选，Enter 跳转，Esc 取消。
 
-通过 `codex24h resume SESSION_UUID` 恢复时，请求列表按该 UUID 读取共享历史；共享历史没有该会话的请求或不可读时，再读取对应 session 日志。无需切换到独立模式。列表绑定启动时指定的会话，原生 agents 或 `/new` 切换不会改变这个范围。
+通过 `codex24h resume SESSION_UUID` 恢复时，请求列表按该 UUID 读取共享历史；共享历史没有该会话的请求或不可读时，再读取对应 session 日志。空会话内执行 `/resume` 或在原生恢复选择器确认会话后，列表跟随所选会话，无需切换到独立模式。原生 agents 或 `/new` 切换仍不在自动跟踪范围内。
 
 普通滚动保留本次终端收到的内容。更早的请求标为 `[full history]`，通过 Codex 原生全文历史打开，无需重新登录或发送模型请求。
 

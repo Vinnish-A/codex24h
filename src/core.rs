@@ -196,6 +196,8 @@ pub struct Core {
     pub requests: crate::requests::Requests,
     native_history: Option<crate::native_history::NativeHistory>,
     pending_native_history: Option<(usize, Instant)>,
+    pending_resume: Option<(Instant, Vec<u8>, Frame)>,
+    input_paste: bool,
     native_ready: bool,
     reopen_requests: bool,
     requests_return: Mode,
@@ -249,6 +251,8 @@ impl Core {
             requests: Default::default(),
             native_history: None,
             pending_native_history: None,
+            pending_resume: None,
+            input_paste: false,
             native_ready: false,
             reopen_requests: false,
             requests_return: Mode::Follow,
@@ -414,6 +418,23 @@ impl Core {
         }
     }
     pub fn tick(&mut self) {
+        if self.pending_resume.is_some() {
+            let screen = self.exit_text();
+            let session = Self::resume_picker_session(&screen);
+            let picker = Self::is_resume_picker(&screen);
+            if session.is_some()
+                || !picker
+                || self.pending_resume.as_ref().unwrap().0.elapsed() >= Duration::from_secs(3)
+            {
+                let (_, bytes, _) = self.pending_resume.take().unwrap();
+                if picker {
+                    self.requests.bind_session(session);
+                    self.bottom();
+                    self.pty_out.extend(bytes);
+                }
+                self.dirty = true;
+            }
+        }
         if self.native_history.is_some() {
             let screen = self.exit_text();
             if !self
@@ -433,6 +454,7 @@ impl Core {
 
         if self.reopen_requests
             && self.native_history.is_none()
+            && self.pending_resume.is_none()
             && !self
                 .exit_text()
                 .lines()
@@ -703,6 +725,10 @@ impl Core {
         self.pty_out.push(0x14);
     }
     pub fn action(&mut self, action: Action) {
+        if self.pending_resume.is_some() && matches!(action, Action::Requests) {
+            self.reopen_requests = true;
+            return;
+        }
         if !matches!(action, Action::TerminalReply(_))
             && self.pending_native_history.take().is_some()
         {
@@ -776,7 +802,7 @@ impl Core {
                 self.mode = Mode::Requests;
                 self.requests.open();
             }
-            Action::Forward(bytes) => self.pty_out.extend(bytes),
+            Action::Forward(bytes) => self.forward_input(bytes),
             Action::TerminalReply(bytes) => {
                 if bytes.starts_with(b"\x1b]52;") && self.clipboard_pending.is_some() {
                     let text = String::from_utf8_lossy(&bytes);
@@ -884,6 +910,91 @@ impl Core {
                 }
             }
         }
+    }
+    fn is_resume_picker(screen: &str) -> bool {
+        screen
+            .lines()
+            .next()
+            .is_some_and(|line| line.trim_start() == "Resume a previous session")
+            && screen
+                .lines()
+                .rev()
+                .take(5)
+                .any(|line| line.trim_start().starts_with("enter resume"))
+    }
+    fn resume_picker_session(screen: &str) -> Option<String> {
+        if !Self::is_resume_picker(screen) {
+            return None;
+        }
+        let mut lines = screen.lines();
+        let first = lines.find_map(|line| line.trim_start().strip_prefix("│ Session:"))?;
+        let mut field = first.to_owned();
+        for line in lines {
+            if line.contains("│ Created:") {
+                break;
+            }
+            field.push_str(line);
+        }
+        let compact: String = field
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '│')
+            .collect();
+        let suffix = compact.rsplit_once('(')?.1;
+        let id = suffix.strip_suffix(')').unwrap_or(suffix);
+        ((8..=36).contains(&id.len())
+            && (!suffix.ends_with(')') || id.len() == 36)
+            && id.bytes().enumerate().all(|(i, c)| {
+                if matches!(i, 8 | 13 | 18 | 23) {
+                    c == b'-'
+                } else {
+                    c.is_ascii_hexdigit()
+                }
+            }))
+        .then(|| id.to_owned())
+    }
+    fn forward_input(&mut self, bytes: Vec<u8>) {
+        let paste = self.input_paste;
+        if bytes == b"\x1b[200~" {
+            self.input_paste = true;
+        } else if bytes == b"\x1b[201~" {
+            self.input_paste = false;
+        }
+        if let Some((_, queued, _)) = &mut self.pending_resume {
+            if !paste
+                && (bytes == b"\x1b"
+                    || bytes == b"\x1b\x1b"
+                    || bytes == b"\x03"
+                    || bytes == b"\x1b[27u")
+            {
+                self.pending_resume = None;
+            } else {
+                queued.extend(bytes);
+                return;
+            }
+        } else if !paste && self.mode == Mode::Follow {
+            let screen = self.exit_text();
+            if Self::is_resume_picker(&screen) {
+                let enter = bytes
+                    .iter()
+                    .position(|b| matches!(b, b'\r' | b'\n'))
+                    .or_else(|| (bytes == b"\x1b[13u" || bytes == b"\x1b[13;1u").then_some(0));
+                if let Some(enter) = enter {
+                    if enter == 0
+                        && let Some(session) = Self::resume_picker_session(&screen)
+                    {
+                        self.requests.bind_session(Some(session));
+                    } else {
+                        let frame = self.frame();
+                        self.pty_out.extend_from_slice(&bytes[..enter]);
+                        self.pty_out.push(5); // Native Ctrl+E exposes the selected session UUID.
+                        self.pending_resume =
+                            Some((Instant::now(), bytes[enter..].to_vec(), frame));
+                        return;
+                    }
+                }
+            }
+        }
+        self.pty_out.extend(bytes);
     }
     fn leave_local(&mut self) {
         // Keep the full document while browsing. A visible-only frame cannot
@@ -1038,6 +1149,9 @@ impl Core {
         out
     }
     pub fn frame(&self) -> Frame {
+        if let Some((_, _, frame)) = &self.pending_resume {
+            return frame.clone();
+        }
         if let Some(history) = &self.native_history {
             let mut frame = self.live_frame();
             frame.status = history.status().into();
@@ -1255,6 +1369,94 @@ mod tests {
     }
     fn text(c: &Core) -> String {
         c.frame().cells.iter().map(|c| c.c).collect()
+    }
+    #[test]
+    fn resume_picker_binds_native_selection_and_discards_old_request_cache() {
+        let mut c = core(100);
+        c.resize(Size {
+            rows: 12,
+            cols: 100,
+        });
+        c.requests.bind_session(Some("old-session".into()));
+        c.requests.texts = vec!["old request".into()];
+        c.process(b"\x1b[2J\x1b[H  Resume a previous session\r\n  enter resume  ctrl+e expand");
+        let before = text(&c);
+        c.action(Action::Forward(b"\r".to_vec()));
+        assert_eq!(c.pty_out, [5]);
+        assert_eq!(
+            text(&c),
+            before,
+            "metadata expansion stays out of the displayed picker"
+        );
+        c.action(Action::Requests);
+        assert!(c.reopen_requests);
+        c.reopen_requests = false;
+        c.process("\x1b[2J\x1b[H  Resume a previous session\r\n    │ Session: title (00000000-0000-4000-8000-000000000001)\r\n    │ Created: yesterday\r\n enter resume".as_bytes());
+        c.tick();
+        assert_eq!(
+            c.requests.session.as_deref(),
+            Some("00000000-0000-4000-8000-000000000001")
+        );
+        assert!(c.requests.texts.is_empty());
+        assert_eq!(c.pty_out, [5, b'\r']);
+    }
+    #[test]
+    fn resume_picker_cancel_or_disappearance_never_submits_to_composer() {
+        for cancel in [false, true] {
+            let mut c = core(100);
+            c.resize(Size {
+                rows: 12,
+                cols: 100,
+            });
+            c.requests.bind_session(Some("old-session".into()));
+            c.process(b"\x1b[2J\x1b[HResume a previous session\r\n enter resume");
+            c.action(Action::Forward(b"\r".to_vec()));
+            if cancel {
+                c.action(Action::Forward(b"\x1b".to_vec()));
+            }
+            c.process(b"\x1b[2J\x1b[HAsk Codex");
+            c.tick();
+            assert!(!c.pty_out.contains(&b'\r'));
+            assert_eq!(c.requests.session.as_deref(), Some("old-session"));
+        }
+    }
+    #[test]
+    fn resume_picker_paste_is_literal_and_wrapped_native_metadata_is_supported() {
+        let mut c = core(100);
+        c.resize(Size {
+            rows: 12,
+            cols: 100,
+        });
+        c.process(b"\x1b[2J\x1b[HResume a previous session\r\n enter resume");
+        for bytes in [b"\x1b[200~".as_slice(), b"literal\r", b"\x1b[201~"] {
+            c.action(Action::Forward(bytes.to_vec()));
+        }
+        assert!(c.pending_resume.is_none());
+        assert_eq!(c.pty_out, b"\x1b[200~literal\r\x1b[201~");
+        c.pty_out.clear();
+        c.action(Action::Forward(b"\x1b[13u".to_vec()));
+        for bytes in [b"\x1b[200~".as_slice(), b"literal\r", b"\x1b[201~"] {
+            c.action(Action::Forward(bytes.to_vec()));
+        }
+        assert_eq!(
+            c.pty_out,
+            [5],
+            "post-selection paste waits with its delimiters intact"
+        );
+        c.process("\x1b[2J\x1b[HResume a previous session\r\n│ Session: title (00000000-0000-4000-8000-000000000001)\r\n│ Created: today\r\n enter resume".as_bytes());
+        c.tick();
+        assert_eq!(c.pty_out, b"\x05\x1b[13u\x1b[200~literal\r\x1b[201~");
+        let screen = "  Resume a previous session\n│ Session: title (00000000-0000-\n│ 4000-8000-000000000001)\n│ Created: today\n enter resume";
+        assert_eq!(
+            Core::resume_picker_session(screen).as_deref(),
+            Some("00000000-0000-4000-8000-000000000001")
+        );
+        assert!(
+            Core::resume_picker_session(
+                &screen.replace("Resume a previous session", "User content")
+            )
+            .is_none()
+        );
     }
     #[test]
     fn capacity_notification_requires_native_red_error_and_ignores_history() {
