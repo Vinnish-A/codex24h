@@ -15,6 +15,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: python -m pip install -r packaging/requirements.txt
       - run: cargo test --locked
+      - run: python tests/install.py
       - run: bash packaging/build.sh
       - name: Smoke test standalone helpers
         run: |

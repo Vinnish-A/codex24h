@@ -3,6 +3,14 @@ set -euo pipefail
 
 bin_dir="${CODEX24H_BIN_DIR:-$HOME/.local/bin}"
 lib_dir="${CODEX24H_LIB_DIR:-$(dirname -- "$bin_dir")/lib/codex24h}"
+installed=false
+installed_version=""
+if [[ -e "$bin_dir/codex24h" || -L "$bin_dir/codex24h" || -e "$lib_dir/current" ]]; then
+    installed=true
+    if [[ -r "$lib_dir/current/VERSION" ]]; then
+        installed_version="$(cat "$lib_dir/current/VERSION")"
+    fi
+fi
 for dependency in curl tar sha256sum; do
     command -v "$dependency" >/dev/null || { printf 'Missing dependency: %s\n' "$dependency" >&2; exit 1; }
 done
@@ -79,7 +87,16 @@ for old_dir in "$lib_dir"/releases/*; do
     done
     if [[ "$in_use" == false ]]; then rm -rf -- "$old_dir"; fi
 done
-printf 'Installed codex24h %s to %s\n' "$version" "$bin_dir"
+if [[ "$installed" == false ]]; then
+    printf 'Installed codex24h %s to %s (first installation).\n' "$version" "$bin_dir"
+elif [[ "$installed_version" == "$package_version" ]]; then
+    printf 'Already installed codex24h %s; refreshed command links in %s.\n' "$version" "$bin_dir"
+elif [[ -n "$installed_version" ]]; then
+    printf 'Updated codex24h v%s -> %s in %s.\n' "$installed_version" "$version" "$bin_dir"
+else
+    printf 'Updated existing codex24h installation to %s in %s.\n' "$version" "$bin_dir"
+fi
+printf 'Mail configuration, SMTP credentials and delivery queue are preserved.\n'
 case ":$PATH:" in
     *":$bin_dir:"*) ;;
     *) printf 'Add %s to your PATH to use the codex24h command.\n' "$bin_dir" ;;

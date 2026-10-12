@@ -168,6 +168,7 @@ impl NativeHistory {
                 } else if footer.iter().any(|s| {
                     (self.editing && s.starts_with("Type to find"))
                         || s.starts_with("enter next")
+                        || s.starts_with("enter accept")
                         || s.starts_with("No matches")
                         || s.starts_with("No more matches")
                         || s.starts_with("History unavailable")
@@ -382,22 +383,29 @@ mod tests {
     }
     #[test]
     fn navigation_waits_for_search_and_never_cancels_the_match() {
-        let mut h = finding();
-        let mut out = vec![];
-        h.action(&Action::Scroll(-3), &mut out, 45);
-        assert!(out.is_empty());
-        h.tick(
-            "/ T R A N S C R I P T /\nFind: query\nenter next · ctrl+p previous",
-            &mut out,
-        );
-        assert_eq!(out, b"\x1b[<65;1;2M");
-        out.clear();
-        h.action(&Action::PageUp, &mut out, 24);
-        assert_eq!(out, b"\x1b[<64;1;2M".repeat(6));
-        out.clear();
-        h.action(&Action::LocalKey(Key::Ctrl(3)), &mut out, 24);
-        assert_eq!(out, b"\x1b[27uq");
-        assert!(!out.contains(&3));
+        for footer in [
+            "enter next · ctrl+p previous",
+            "enter accept · ^p older · ^n newer · full transcript · esc cancel",
+        ] {
+            let mut h = finding();
+            let mut out = vec![];
+            h.action(&Action::Scroll(-3), &mut out, 45);
+            h.tick("/ T R A N S C R I P T /\nFind: query\nSearching…", &mut out);
+            assert!(out.is_empty());
+            h.tick(
+                &format!("/ T R A N S C R I P T /\nFind: query\n{footer}"),
+                &mut out,
+            );
+            assert!(!h.status().contains("searching"));
+            assert_eq!(out, b"\x1b[<65;1;2M");
+            out.clear();
+            h.action(&Action::PageUp, &mut out, 24);
+            assert_eq!(out, b"\x1b[<64;1;2M".repeat(6));
+            out.clear();
+            h.action(&Action::LocalKey(Key::Ctrl(3)), &mut out, 24);
+            assert_eq!(out, b"\x1b[27uq");
+            assert!(!out.contains(&3));
+        }
     }
     #[test]
     fn cancelling_in_flight_open_closes_when_acknowledged() {

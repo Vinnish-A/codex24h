@@ -20,6 +20,8 @@ curl -fsSL https://raw.githubusercontent.com/Vinnish-A/codex24h/main/install.sh 
 
 从 [Release](https://github.com/Vinnish-A/codex24h/releases/latest) 下载预编译包并校验 SHA-256，命令放在 `~/.local/bin`。临时文件自动清理，运行中的会话不受更新影响。
 
+脚本区分首次安装、版本更新和同版本刷新入口；更新时显示旧、新版本。邮件配置、SMTP 授权码和发信队列保留，无需重新配置邮箱。下载的是已发布的 Release，不是 `main` 上尚未发布的源码。
+
 ## 使用
 
 用法与 `codex` 相同：
@@ -35,15 +37,16 @@ codex24h resume --last
 
 同时维护多个版本的适配。每次启动按当前 `PATH` 查找 `codex`，也可用 `CODEX24H_CODEX=/path/to/codex` 选择已安装版本；切换或升级 Codex 后，下次启动立即使用所选版本，已运行的会话继续使用原进程。wrapper 不固定 Codex 版本，也不自行升级 Codex。
 
-目前验证支持 **0.158.0、0.159.2、0.160.0**：
+目前验证支持 **0.158.0、0.159.2、0.160.0、0.162.0**：
 
 | Codex CLI | 验证内容 |
 |---|---|
 | 0.158.0 | 恢复会话、`← for agents`、Esc 返回、原生 Tab 补全、完成邮件、tmux 前端重连；独立模式保留 `notify` 路径 |
 | 0.159.2 | 恢复会话、`← for agents`、Esc 返回、原生 Tab 补全、完成邮件、tmux 前端重连 |
 | 0.160.0 | 恢复会话、`← for agents`、Esc 返回、原生 Tab 补全、完成邮件、tmux 前端重连 |
+| 0.162.0 | 恢复会话、`← for agents`、Esc 返回、原生 Tab 补全、完成邮件、空会话内 `/resume` 及再次切换后的请求检索 |
 
-共享模式的上述测试使用 **0.160.0 app-server**。CLI 与后台服务版本可以不同；wrapper 跟随所选 CLI，后台服务由 Codex 管理。旧版后台服务、未列出的 CLI 和其他平台不列为本轮已验证组合，见 [测试记录](TESTING.md)。
+0.158.0–0.160.0 的共享模式测试使用 **0.160.0 app-server**；0.162.0 使用 **0.162.1 app-server**，客户端以 `--disable api_key_model_discovery` 对齐已有后台的设置，未重启后台。CLI 与后台服务版本可以不同；wrapper 跟随所选 CLI，后台服务由 Codex 管理。共享 feature 设置不一致时仍可能出现原生重启提示。旧版后台服务、未列出的 CLI 和其他平台不列为本轮已验证组合，见 [测试记录](TESTING.md)。
 
 适配按实际能力选择：共享模式通过临时事件管道和只读完成元数据发邮件，避免邮件用的 `-c notify=...` 把 Codex 切换为独立写入者；旧版独立模式及显式 `--no-daemon` 保留原生通知。原生支持 agents 时，在空输入框按 **←** 打开任务列表，Esc 返回；该按键保持交给 Codex。
 

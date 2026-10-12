@@ -52,7 +52,8 @@ def main():
                 Path(os.environ['CODEX24H_TEST_CAPTURE']).write_text(view)
             raise AssertionError(label+' timed out; footer: '+repr(view.splitlines()[-1]))
         try:
-            wait(lambda v: 'Ask Codex' in v and 'Resuming session' not in v and ('for agents' in v or '? for shortcuts' in v), 'shared resume ready')
+            # A narrow native footer can clip "agents" after its arrow shortcut.
+            wait(lambda v: 'Ask Codex' in v and 'Resuming session' not in v and ('← for ' in v or '? for shortcuts' in v), 'shared resume ready')
             for target in [args.session, *([args.switch_to] if args.switch_to else [])]:
                 original = helper.read_shared_session(home, target)
                 requests = [r['text'] for r in original['requests']]
