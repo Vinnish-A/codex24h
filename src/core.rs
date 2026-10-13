@@ -339,12 +339,11 @@ impl Core {
             let first = (0..self.size.cols).find(|&col| !cells[Column(col)].c.is_whitespace());
             let Some(col) = first else { continue };
             let cell = &cells[Column(col)];
-            if cell.c != '■'
-                || !matches!(
-                    cell.fg,
-                    Color::Named(NamedColor::Red | NamedColor::BrightRed)
-                )
-            {
+            let red = |color| {
+                matches!(color, Color::Named(NamedColor::Red | NamedColor::BrightRed))
+                    || matches!(color, Color::Spec(Rgb { r, g, b }) if r > 150 && u16::from(g)*3 < u16::from(r)*2 && u16::from(b)*3 < u16::from(r)*2)
+            };
+            if cell.c != '■' || !red(cell.fg) {
                 continue;
             }
             let mut text = String::new();
@@ -352,11 +351,7 @@ impl Core {
                 let cells = &self.term.grid()[Line(next as i32)];
                 for col in 0..self.size.cols {
                     let cell = &cells[Column(col)];
-                    if matches!(
-                        cell.fg,
-                        Color::Named(NamedColor::Red | NamedColor::BrightRed)
-                    ) && !cell.c.is_whitespace()
-                    {
+                    if red(cell.fg) && !cell.c.is_whitespace() {
                         text.extend(cell.c.to_lowercase());
                     }
                 }
@@ -365,11 +360,71 @@ impl Core {
                 || text.starts_with("■loadedmodelisatcapacity")
                 || text.starts_with("■theloadedmodelisatcapacity")
                 || text.starts_with("■server_overloaded")
+                || (text.starts_with("■unexpectedstatus") && text.contains("modelisatcapacity"))
             {
                 return Some(true);
             }
         }
         Some(false)
+    }
+
+    /// Accept automatic input only at an empty, idle native composer. A draft,
+    /// picker, approval, local browser, or hidden cursor is never overwritten.
+    pub fn recovery_ready(&self) -> bool {
+        if self.mode != Mode::Follow
+            || self.native_history.is_some()
+            || self.pending_resume.is_some()
+            || self.input_paste
+        {
+            return false;
+        }
+        let live = self.live_frame();
+        let Some((row, col)) = live.cursor else {
+            return false;
+        };
+        let cells = &live.cells[row * live.cols..(row + 1) * live.cols];
+        let Some(marker) = cells.iter().position(|c| c.c == '›') else {
+            return false;
+        };
+        col == marker + 2
+            && cells[..marker].iter().all(|c| c.c.is_whitespace())
+            && cells[marker + 1..]
+                .iter()
+                .all(|c| c.c.is_whitespace() || c.flags.contains(Flags::DIM))
+    }
+
+    /// Read a newly requested native status card in a separate terminal with
+    /// no prior chat output; old status cards cannot select another session.
+    pub fn status_session(&self) -> Option<String> {
+        let mut text = String::new();
+        for row in -(self.term.history_size() as i32)..self.size.rows as i32 {
+            for col in 0..self.size.cols {
+                text.push(self.term.grid()[Line(row)][Column(col)].c);
+            }
+            text.push('\n');
+        }
+        if !["OpenAI Codex", "Directory", "Permissions"]
+            .iter()
+            .all(|s| text.contains(s))
+        {
+            return None;
+        }
+        let (_, after) = text.split_once("Session")?;
+        let (_, after) = after.split_once(':')?;
+        let id: String = after
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '│')
+            .take(36)
+            .collect();
+        (id.len() == 36
+            && id.bytes().enumerate().all(|(i, c)| {
+                if matches!(i, 8 | 13 | 18 | 23) {
+                    c == b'-'
+                } else {
+                    c.is_ascii_hexdigit()
+                }
+            }))
+        .then_some(id)
     }
 
     pub fn process(&mut self, bytes: &[u8]) {
@@ -1369,6 +1424,34 @@ mod tests {
     }
     fn text(c: &Core) -> String {
         c.frame().cells.iter().map(|c| c.c).collect()
+    }
+    #[test]
+    fn recovery_requires_empty_native_composer_and_no_local_overlay() {
+        let mut c = core(100);
+        c.process("\x1b[2J\x1b[H› \x1b[2mAsk Codex\x1b[0m\x1b[1;3H".as_bytes());
+        assert!(c.recovery_ready());
+        c.mode = Mode::Browse;
+        assert!(!c.recovery_ready());
+        c.mode = Mode::Follow;
+        c.process("\x1b[2J\x1b[H› draft\x1b[1;3H".as_bytes());
+        assert!(
+            !c.recovery_ready(),
+            "cursor at draft start must not allow injection"
+        );
+        c.process(b"\x1b[2J\x1b[HApproval required");
+        assert!(!c.recovery_ready());
+    }
+    #[test]
+    fn native_status_identity_requires_card_fields_and_handles_wrapped_uuid() {
+        let mut c = core(100);
+        c.process(b"Session: 11111111-1111-4111-8111-111111111111");
+        assert!(c.status_session().is_none());
+        let mut c = core(100);
+        c.process(b"OpenAI Codex\r\nDirectory: /test\r\nPermissions: default\r\nSession: 11111111-1111-4111-\r\n8111-111111111111");
+        assert_eq!(
+            c.status_session().as_deref(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
     }
     #[test]
     fn resume_picker_binds_native_selection_and_discards_old_request_cache() {

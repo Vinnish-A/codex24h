@@ -179,6 +179,91 @@ class MailTests(unittest.TestCase):
         self.assertEqual(observer.completed(), [
             {'type':'agent-turn-complete','thread-id':session,'turn-id':'active'}])
 
+    def test_shared_capacity_uses_failed_turn_metadata_without_frontend_rollout(self):
+        history = self.home/'thread_history_1.sqlite'
+        with sqlite3.connect(history) as conn:
+            conn.execute('CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,status TEXT,completed_at INTEGER,error_json TEXT)')
+            conn.execute('CREATE TABLE thread_items(thread_id TEXT,item_type TEXT,created_at_ms INTEGER,item_json TEXT)')
+        observer = mail.CompletionWatch(self.home)
+        observer.record({'dir':'from_tui','kind':'op','payload':{'UserTurn':{'client_user_message_id':'capacity-message'}}})
+        error = json.dumps({'message':'Selected model is at capacity. PRIVATE ERROR DETAILS',
+                            'codexErrorInfo':'serverOverloaded','additionalDetails':None})
+        with sqlite3.connect(history) as conn:
+            conn.execute('INSERT INTO thread_items VALUES (?,?,?,?)',
+                         ('session-1','userMessage',observer.since-1000,json.dumps({'clientId':'capacity-message'})))
+            conn.executemany('INSERT INTO thread_turns VALUES (?,?,?,?,?)', [
+                ('other-session','unrelated','failed',int(time.time()),error),
+                ('session-1','capacity-turn','failed',int(time.time()),error),
+                ('session-1','network-turn','failed',int(time.time()),json.dumps({'message':'network error'})),
+                ('session-1','cancelled','interrupted',int(time.time()),error),
+            ])
+        events = observer.completed()
+        self.assertEqual(events, [{'type':'model_capacity','thread-id':'session-1','turn-id':'capacity-turn'}])
+        self.assertEqual(observer.completed(), [])
+        key = mail.enqueue(self.cfg,self.config,self.home,observer.since,events[0])
+        self.assertIsNotNone(key)
+        payload = self.job(key)[0]
+        self.assertEqual(payload['type'],'model_capacity')
+        self.assertFalse(payload['goal_completed'])
+        self.assertNotIn('PRIVATE',json.dumps(payload))
+        self.assertEqual(mail.enqueue(self.cfg,self.config,self.home,observer.since,events[0]),key)
+        for source in ('{"subagent":{}}',None):
+            with sqlite3.connect(self.home/'state_5.sqlite') as conn:
+                conn.execute('UPDATE threads SET source=?',(source,))
+            self.assertIsNone(mail.enqueue(self.cfg,self.config,self.home,observer.since,events[0]))
+
+    def test_http_prefixed_capacity_is_a_failure_but_plain_network_error_is_not(self):
+        with sqlite3.connect(self.home/'thread_history_1.sqlite') as conn:
+            conn.execute('CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,status TEXT,completed_at INTEGER,error_json TEXT)')
+            conn.execute('CREATE TABLE thread_items(thread_id TEXT,item_type TEXT,item_json TEXT)')
+        observer = mail.CompletionWatch(self.home)
+        observer.sessions.add('session-1')
+        with sqlite3.connect(self.home/'thread_history_1.sqlite') as conn:
+            for turn,message in [('http-capacity','unexpected status 503 Service Unavailable: Selected model is at capacity.'),
+                                 ('http-network','unexpected status 503 Service Unavailable: temporarily unavailable')]:
+                conn.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)',
+                    ('session-1',turn,'failed',int(time.time()),json.dumps({'message':message,'codexErrorInfo':{'httpConnectionFailed':{'httpStatusCode':503}}})))
+        self.assertEqual(observer.completed(),[{'type':'model_capacity','thread-id':'session-1','turn-id':'http-capacity'}])
+
+    def test_shared_capacity_resume_ignores_old_failure_and_reports_current_turn(self):
+        session = '11111111-1111-4111-8111-111111111111'
+        error = json.dumps({'message':'Selected model is at capacity','codexErrorInfo':'serverOverloaded'})
+        history = self.home/'thread_history_1.sqlite'
+        with sqlite3.connect(history) as conn:
+            conn.execute('CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,status TEXT,completed_at INTEGER,error_json TEXT)')
+            conn.executemany('INSERT INTO thread_turns VALUES (?,?,?,?,?)', [
+                (session,'old-capacity','failed',int(time.time()),error),
+                (session,'active','inProgress',None,None),
+            ])
+        observer = mail.CompletionWatch(self.home,session)
+        self.assertEqual(observer.completed(),[])
+        with sqlite3.connect(history) as conn:
+            conn.execute("UPDATE thread_turns SET status='failed',completed_at=?,error_json=? WHERE turn_id='active'",
+                         (int(time.time()),error))
+        self.assertEqual(observer.completed(),[{'type':'model_capacity','thread-id':session,'turn-id':'active'}])
+        self.assertEqual(observer.completed(),[])
+
+    def test_shared_capacity_follows_runtime_resume_without_losing_a_fast_failure(self):
+        session = '11111111-1111-4111-8111-111111111111'
+        error = json.dumps({'message':'Selected model is at capacity','codexErrorInfo':'serverOverloaded'})
+        with sqlite3.connect(self.home/'state_5.sqlite') as conn:
+            conn.execute('INSERT INTO threads VALUES (?,?,?,?)',(session,'resumed','resumed','cli'))
+        history = self.home/'thread_history_1.sqlite'
+        with sqlite3.connect(history) as conn:
+            conn.execute('CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,status TEXT,completed_at INTEGER,error_json TEXT)')
+            conn.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)',
+                         (session,'old-capacity','failed',int(time.time())-2,error))
+        observer = mail.CompletionWatch(self.home)
+        selection = {'dir':'codex24h','kind':'resume','session':session[:30],'since':int(time.time())}
+        # The daemon can finish between selecting the session and reading its FIFO.
+        with sqlite3.connect(history) as conn:
+            conn.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)',
+                         (session,'fast-capacity','failed',int(time.time()),error))
+        observer.record(selection)
+        self.assertEqual(observer.completed(),[{'type':'model_capacity','thread-id':session,'turn-id':'fast-capacity'}])
+        observer.record(selection|{'session':session})
+        self.assertEqual(observer.completed(),[])
+
     def test_no_email_for_interrupt_or_subagent(self):
         self.assertIsNone(self.enqueue(type='turn-aborted'))
         with sqlite3.connect(self.home / 'state_5.sqlite') as conn:

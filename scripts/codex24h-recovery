@@ -1,0 +1,300 @@
+"""Capacity recovery controller. Commands cross a private, acknowledged PTY bridge."""
+import contextlib
+import datetime
+import json
+import os
+from pathlib import Path
+import random
+import sqlite3
+import time
+import uuid
+
+
+def read_json(path):
+    try:
+        return json.loads(Path(path).read_bytes())
+    except FileNotFoundError:
+        return None
+
+
+def atomic_json(path, value):
+    path = Path(path)
+    pending = path.with_suffix('.next')
+    pending.write_text(json.dumps(value))
+    pending.replace(path)
+
+
+def goal_state(home, session):
+    # An absent/unreadable store is unknown, never evidence of an ordinary task.
+    path = Path(home)/'goals_1.sqlite'
+    with contextlib.closing(sqlite3.connect(path.resolve().as_uri()+'?mode=ro', uri=True, timeout=.5)) as conn:
+        row = conn.execute('SELECT goal_id,status FROM thread_goals WHERE thread_id=?', (session,)).fetchone()
+    return tuple(row) if row else None
+
+
+class Recovery:
+    def __init__(self, mail, cfg, args, directory, observer):
+        self.mail, self.cfg, self.args = mail, cfg, args
+        self.directory, self.observer = Path(directory), observer
+        self.scope = str(args.config.resolve())
+        self.active = None
+        self.proof = None
+        self.messages = {}
+        self.pending = {}
+        self.owner = f"{os.getpid()}:{Path('/proc/self/stat').read_text().split()[21]}:{uuid.uuid4()}"
+        self.native_seen = None
+        self.discover = None
+        with mail['database'](cfg) as conn:
+            conn.execute('''CREATE TABLE IF NOT EXISTS capacity_budgets (
+                config TEXT,session TEXT,attempts INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(config,session))''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS capacity_inputs (
+                config TEXT,message TEXT,PRIMARY KEY(config,message))''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS capacity_claims (
+                key TEXT PRIMARY KEY,owner TEXT,phase TEXT)''')
+            conn.commit()
+            stranded = conn.execute("SELECT j.key,c.owner FROM jobs j LEFT JOIN capacity_claims c ON c.key=j.key WHERE j.config=? AND j.state='recovering'",(self.scope,)).fetchall()
+        for key, owner in stranded:
+            alive = False
+            if owner:
+                try:
+                    pid, started, _ = str(owner).split(':')
+                    alive = Path(f'/proc/{int(pid)}/stat').read_text().split()[21] == started
+                except (ValueError, FileNotFoundError, ProcessLookupError):
+                    pass
+            if not alive:
+                self.finish({'key':key},'blocked','上次自动恢复过程已中断，提交结果不明；为避免重复执行，不重发，请检查容量。')
+
+    def frontend(self):
+        return read_json(self.directory/'frontend.json')
+
+    def reset(self, session, message=None):
+        with self.mail['database'](self.cfg) as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            if message and not conn.execute('INSERT OR IGNORE INTO capacity_inputs VALUES (?,?)',
+                                           (self.scope,message)).rowcount:
+                return
+            conn.execute('INSERT INTO capacity_budgets VALUES (?,?,0) ON CONFLICT(config,session) DO UPDATE SET attempts=0',
+                         (self.scope,session))
+            conn.commit()
+
+    def record(self, record):
+        state = self.frontend()
+        if not state:
+            return
+        if record.get('dir') == 'codex24h' and record.get('kind') == 'resume':
+            # This selection was confirmed by the wrapper's native picker logic.
+            if record.get('generation') == state['generation']:
+                target = record.get('session')
+                matches = [s for s in self.observer.sessions if s.startswith(target)]
+                if len(matches) == 1:
+                    self.active, self.proof = matches[0], state['generation']
+                    if self.discover:
+                        self.reset(matches[0], 'goal-'+self.discover['event'])
+                    self.discover = None
+            return
+        if (record.get('dir') == 'to_tui' and record.get('kind') == 'app_event'
+                and record.get('variant') in ('SetThreadGoalDraft', 'SetThreadGoalStatus')):
+            # Goal commands have no UserTurn/clientId. Ask this exact TUI for
+            # its native status rather than guessing the most recent Goal.
+            if self.proof != state['generation']:
+                stamp = record.get('ts')
+                try:
+                    fresh = round(datetime.datetime.fromisoformat(stamp.replace('Z','+00:00')).timestamp()*1000) >= state['input_at_ms']
+                except (AttributeError, ValueError):
+                    fresh = False
+                if fresh:
+                    self.discover = {'generation':state['generation'], 'due':time.monotonic()+8, 'sent':False, 'event':stamp}
+            return
+        if record.get('dir') != 'from_tui' or record.get('kind') != 'op':
+            return
+        payload = record.get('payload')
+        turn = payload.get('UserTurn',{}) if isinstance(payload,dict) else {}
+        message = turn.get('client_user_message_id')
+        if not message:
+            return
+        text = ''.join(item.get('text','') for item in turn.get('items',[]) if isinstance(item,dict))
+        own = next((job for job in self.pending.values()
+                    if job['phase'] == 'dispatch' and job['command'] == 'go on' and text == 'go on'
+                    and state['generation'] == job['generation']), None)
+        # Millisecond native timestamps must strictly follow the last human input.
+        # An old buffered UserTurn cannot restore proof after /new or agent switches.
+        try:
+            stamp = round(datetime.datetime.fromisoformat(record['ts'].replace('Z','+00:00')).timestamp()*1000)
+            fresh = stamp > state['input_at_ms']
+        except (KeyError, ValueError, TypeError):
+            fresh = False
+        self.messages[message] = {'generation':state['generation'], 'fresh':fresh,
+                                  'automatic':own['key'] if own else None}
+
+    def resolve_messages(self):
+        path = Path(self.args.codex_home)/'thread_history_1.sqlite'
+        if not path.exists() or not self.messages:
+            return
+        with contextlib.closing(sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True,timeout=.5)) as conn:
+            for message, info in list(self.messages.items()):
+                row = conn.execute("SELECT thread_id FROM thread_items WHERE item_type='userMessage' AND json_extract(item_json,'$.clientId')=?",(message,)).fetchone()
+                if not row:
+                    continue
+                session = row[0]
+                if info['automatic']:
+                    job = self.pending.get(info['automatic'])
+                    if job and session == job['session']:
+                        job['confirmed'] = True
+                else:
+                    self.reset(session,message)
+                if info['fresh'] or info['automatic']:
+                    self.active,self.proof = session,info['generation']
+                del self.messages[message]
+
+    def finish(self, job, outcome, detail):
+        key = job['key']
+        with self.mail['database'](self.cfg) as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute('SELECT payload FROM jobs WHERE key=?',(key,)).fetchone()
+            payload = json.loads(row[0])
+            payload['recovery'] = outcome
+            payload['recovery_detail'] = detail
+            if 'attempt' in job:
+                payload['recovery_attempt'] = job['attempt']
+            conn.execute("UPDATE jobs SET payload=?,state='pending' WHERE key=?",(json.dumps(payload,ensure_ascii=False),key))
+            conn.execute('UPDATE capacity_claims SET phase=? WHERE key=?',(outcome,key))
+            conn.commit()
+        self.pending.pop(key,None)
+        self.mail['spawn_worker'](self.args.config,key)
+
+    def capacity(self, event):
+        # enqueue's existing main-session validation and unique key are shared by
+        # manual delivery and recovery. Hold the job until submission is confirmed.
+        key = self.mail['enqueue'](self.cfg,self.args.config,self.args.codex_home,self.observer.since,event,hold=self.owner)
+        if not key:
+            return
+        with self.mail['database'](self.cfg) as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute('SELECT state FROM jobs WHERE key=?',(key,)).fetchone()
+            if row[0] != 'recovering':
+                return
+            claim = conn.execute('SELECT owner,phase FROM capacity_claims WHERE key=?',(key,)).fetchone()
+            conn.commit()
+        if not claim or claim != (self.owner,'wait') or key in self.pending:
+            return
+        session = event['thread-id']
+        job = {'key':key,'session':session,'turn':event['turn-id'],'phase':'wait',
+               'due':time.monotonic()+random.SystemRandom().uniform(3,10),
+               'generation':self.proof if session == self.active else None}
+        try:
+            job['goal'] = goal_state(self.args.codex_home,session)
+        except sqlite3.Error:
+            job['goal_unknown'] = True
+        self.pending[key] = job
+
+    def native_capacity(self):
+        if not self.args.standalone:
+            return
+        record = read_json(self.directory/'native-capacity.json')
+        if not record or record == self.native_seen:
+            return
+        self.native_seen = record
+        try:
+            session, turn = self.mail['owned_capacity'](self.args.codex_home,record['pid'])
+        except (ValueError, RuntimeError, OSError):
+            return
+        if not turn:
+            return
+        self.active,self.proof = session,record['generation']
+        self.capacity({'type':'model_capacity','thread-id':session,'turn-id':turn})
+
+    def latest(self, session):
+        path = Path(self.args.codex_home)/'thread_history_1.sqlite'
+        with contextlib.closing(sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True,timeout=.5)) as conn:
+            return conn.execute('SELECT turn_id,status FROM thread_turns WHERE thread_id=? ORDER BY rowid DESC LIMIT 1',(session,)).fetchone()
+
+    def tick(self):
+        self.resolve_messages()
+        state = self.frontend()
+        if not state:
+            # A manually invoked watcher has no input bridge: report visibly.
+            if self.pending:
+                for job in list(self.pending.values()):
+                    self.finish(job,'blocked','当前前端没有自动恢复通道，请检查容量并手动继续。')
+            return
+        if self.active is None and self.args.session and state['generation'] == 0:
+            matches = list(self.observer.sessions)
+            if len(matches) == 1:
+                self.active,self.proof = matches[0],0
+        if self.discover:
+            if self.discover['generation'] != state['generation']:
+                self.discover = None
+            elif time.monotonic() >= self.discover['due']:
+                print('codex24h-mail: current Goal session could not be confirmed; no automatic command was sent',file=__import__('sys').stderr)
+                self.discover = None
+            elif state['ready'] and not self.discover['sent'] and not any(j['phase']=='dispatch' for j in self.pending.values()):
+                atomic_json(self.directory/'recovery-request.json',{'key':'identity-'+str(uuid.uuid4()),'generation':state['generation'],'command':'/status'})
+                self.discover['sent'] = True
+        for job in list(self.pending.values()):
+            if job['phase'] == 'dispatch':
+                ack = read_json(self.directory/'recovery-ack.json')
+                if ack and ack.get('key') == job['key']:
+                    if ack['status'] != 'written':
+                        self.finish(job,'blocked','前端已变化或输入框非空，未自动发送；请检查容量。')
+                        continue
+                    job['written'] = True
+                try:
+                    if job['command'] == '/goal resume' and job.get('written'):
+                        goal = goal_state(self.args.codex_home,job['session'])
+                        latest = self.latest(job['session'])
+                        # Goal may already have paused again after another capacity
+                        # error. A new turn also proves native resume acceptance.
+                        job['confirmed'] = (goal and goal[0] == job['goal'][0] and
+                                            (goal[1] == 'active' or (latest and latest[0] != job['turn'])))
+                except sqlite3.Error:
+                    pass
+                if job.get('written') and job.get('confirmed'):
+                    self.finish(job,'submitted',f"自动恢复请求已提交，第 {job['attempt']}/3 次；指令：{job['command']}。任务是否完成以 Codex 后续结果为准。")
+                elif time.monotonic() >= job['confirm_by']:
+                    self.finish(job,'blocked','自动恢复提交未获 Codex 确认；为避免重复执行，不重发，请检查容量及当前会话。')
+                continue
+            if time.monotonic() < job['due']:
+                continue
+            try:
+                goal = goal_state(self.args.codex_home,job['session'])
+                latest = self.latest(job['session'])
+            except sqlite3.Error:
+                self.finish(job,'blocked','无法读取可靠的任务/Goal 状态，未自动发送，请检查容量。')
+                continue
+            initial = job.get('goal')
+            if (job.get('goal_unknown') or (goal is None) != (initial is None)
+                    or (goal and goal[0] != initial[0])):
+                self.finish(job,'blocked','Goal 状态已变化或初始状态不明，未自动发送，请检查当前任务。')
+                continue
+            if goal and goal[1] != 'paused':
+                self.finish(job,'skipped' if goal[1] == 'complete' else 'blocked',
+                            'Goal 已完成，无需恢复。' if goal[1] == 'complete' else 'Goal 当前不是 paused，未自动恢复，请检查容量。')
+                continue
+            if latest is None:
+                self.finish(job,'blocked','无法确认容量失败回合，未自动发送，请检查容量。')
+                continue
+            if latest != (job['turn'],'failed'):
+                self.finish(job,'skipped','原失败回合已被后续请求替代，无需重复恢复。')
+                continue
+            if (job['generation'] is None or job['generation'] != state['generation']
+                    or self.active != job['session'] or not state['ready']):
+                self.finish(job,'blocked','会话已切换、存在输入草稿或当前前端无法确认，未自动发送，请检查容量。')
+                continue
+            # One outstanding private command per frontend; other jobs wait.
+            if any(other['phase'] == 'dispatch' for other in self.pending.values()):
+                continue
+            with self.mail['database'](self.cfg) as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                conn.execute('INSERT OR IGNORE INTO capacity_budgets VALUES (?,?,0)',(self.scope,job['session']))
+                count = conn.execute('SELECT attempts FROM capacity_budgets WHERE config=? AND session=?',(self.scope,job['session'])).fetchone()[0]
+                if count < 3:
+                    conn.execute('UPDATE capacity_budgets SET attempts=attempts+1 WHERE config=? AND session=?',(self.scope,job['session']))
+                    conn.execute("UPDATE capacity_claims SET phase='dispatch' WHERE key=?",(job['key'],))
+                conn.commit()
+            if count >= 3:
+                self.finish(job,'exhausted','容量不足，请检查。连续自动恢复已达 3 次，本次不再自动发送。')
+                continue
+            job.update(phase='dispatch',attempt=count+1,command='/goal resume' if goal else 'go on',confirm_by=time.monotonic()+15)
+            atomic_json(self.directory/'recovery-request.json',
+                        {k:job[k] for k in ('key','generation','command')})

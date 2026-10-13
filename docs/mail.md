@@ -7,7 +7,8 @@
 ```text
 [Codex24h][本轮已完成] 整理实验数据
 [Codex24h][Goal 已完成] 整理实验数据
-[Codex24h][模型容量不足] 整理实验数据
+[Codex24h][自动恢复请求已提交] 整理实验数据
+[Codex24h][容量不足，请检查] 整理实验数据
 ```
 
 ## 新服务器配置
@@ -75,9 +76,22 @@ codex24h
 
 ## 模型容量不足
 
-原生 TUI 显示 `Selected model is at capacity` 或 `Loaded model is at capacity` 的红色错误行时，自动发送类型为 **模型容量不足** 的邮件，附会话名和恢复命令。它不代表任务完成，不会标成 Goal 完成。
+启用邮件后，codex24h 承载的 TUI 遇到容量错误，会对每个不同失败回合**独立随机等待 3～10 秒**，然后尝试恢复：
 
-同一轮任务的容量错误只提示一次，重绘或重试不重复；下一轮再次遇到容量错误会重新提示。普通输入、回答中引用这些文字、全文历史浏览不会触发。该通知识别的是原生红色错误行，并非 session 错误事件；Codex 0.158.0 不保存这种事件到 session。当前只覆盖 codex24h 承载的 TUI，`exec` 的容量错误通知尚未支持。
+- 普通任务提交 `go on`。
+- Goal 从状态库确认身份，只在发送前仍为 `paused` 时提交 `/goal resume`。`complete`（界面 achieved）不恢复；`active`、`blocked`、用量或预算限制状态不自动改动。
+- Codex 确认接收恢复请求之后才发 **自动恢复请求已提交** 邮件，注明第几次、指令及 Session ID；这表示请求已提交，不表示任务已成功完成。
+- 每个会话连续自动恢复最多三次，第四次容量失败不再自动回复，发送 **容量不足，请检查**。成功完成一轮或手动提交新任务后重置；自动 `go on` 不重置，同轮重绘不重复计数。计数保存在邮件状态库，多个前端共用上限。
+
+等待期间输入、草稿、切换会话、原生菜单或无法确认状态时不会盲发指令，会发送恢复受阻的检查通知。未确认的提交占用一次额度，避免不确定情况下反复执行。程序中断后不会重放旧恢复指令；再次打开前端时将中断记录转成检查通知。`retry` 只重试邮件，不会重新提交模型任务。
+
+共享后台模式按本前端确认会话的结构化失败记录识别 `serverOverloaded`、原生容量错误及带 HTTP 状态前缀的容量错误，不依赖错误行颜色或前端持有日志。会话来自本前端用户消息 ID、明确恢复 UUID 和原生 `/resume` 确认。新建 Goal 的指令没有普通消息 ID，必要时在当前前端执行只读 `/status` 获取实际 Session ID，再读取 Goal 状态，不猜测最近会话。
+
+控制信息通过私有临时目录中的原子文件传递，与 Codex 事件管道分开；不保存对话正文。发送前仍检查主会话归属，子 agent 与身份不明的会话不发信。状态库不可读会阻止自动回复；无法确认归属时也不会发送邮件，终端会报告元数据问题。监控进程退出时状态栏持续显示 `Mail / recovery unavailable`，Codex 继续运行；重新打开前端恢复监控。
+
+独立模式保留原生完成通知，并使用结构化失败记录及本进程日志定位的原生红色容量错误接入相同恢复流程。当前恢复能力验证于 Codex 0.162.0/0.162.1 元数据；缺少可读 Goal 状态库的旧版本不会被当成普通任务盲发 `go on`。`exec` 的容量恢复和远程 app-server 尚未支持。
+
+不会批量补发启动前的历史容量错误。更新后需新启动或使用 `codex24h resume SESSION_UUID` 恢复前端，既有前端不会自动加载新代码；不需要重启共享后台。邮件配置、授权码和队列保留。
 
 ## 其他配置
 
@@ -116,7 +130,7 @@ CODEX24H_MAIL=0 codex24h resume --last
 
 ## 触发方式与范围
 
-使用 Codex 原生的 [`notify` / `agent-turn-complete` 事件](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications)。Wrapper 仅为本次启动附加通知配置，不修改 Codex 全局配置；原有通知命令仍会执行。没有轮询终端文字，没有用模型判断是否发信。
+使用 Codex 原生的 [`notify` / `agent-turn-complete` 事件](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications)。Wrapper 仅为本次启动附加通知配置，不修改 Codex 全局配置；原有通知命令仍会执行。共享模式通过作用域内的轮次元数据观察完成和容量事件；没有用模型判断是否发信。
 
 会话名称、来源、父子关系和 Goal 状态从本机 Codex 元数据只读获取；版本验证范围见 [README](../README.md#codex-版本兼容)。名称优先使用手动命名，其次使用 Codex 保存的标题；名称为空时以 Session ID 标识。邮件不附带对话正文。子 agent 的独立完成事件和容量错误不发送邮件。
 
@@ -129,6 +143,11 @@ Goal 必须在本次接入通知之后变为 `complete` 才会标注，且每个
 ```bash
 cargo build --locked
 python3 tests/mail.py
+python3 tests/recovery.py
+
+# 可选：真实 Codex + 隔离后台 + 本地模拟 SSE 容量错误及 TLS SMTP，无外部模型请求。
+CODEX24H_CODEX=/path/to/codex python3 tests/native_capacity.py
+CODEX24H_CODEX=/path/to/codex python3 tests/native_capacity.py --standalone
 
 # 可选：发送两次真实模型请求，验证 exec 和 resume TUI 自动通知。
 # 邮件只投递给本机测试 TLS SMTP 服务，不发到外部邮箱。

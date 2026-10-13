@@ -1,5 +1,16 @@
 # 本机验证记录
 
+## 2026-10-13：v0.2.4 容量检测与随机自动恢复
+
+环境：Linux / WSL、打包 Python 3.10.12，真实 Codex CLI / app-server 0.162.0、0.162.1。模型错误由隔离的本机 SSE 服务返回，邮件只投递至临时 TLS SMTP。测试使用临时 CODEX_HOME 和专用后台，不重启生产后台，不发送业务请求或外部邮件。
+
+- 根因：旧容量 helper 用前端 PID 查持有的日志；共享模式日志由后台持有，导致入队前就失败。原共享 watcher 只看 completed，遗漏 failed。旧容量包测试仅模拟持有日志的独立进程，无法覆盖共享场景；新增完整共享前端、结构化失败、FIFO、SMTP 及运行时 `/resume` 测试。
+- 诊断时只读核对实际 39 条历史容量失败，均为结构化 `serverOverloaded`，新分类器全部识别；未将这些旧记录入队或补发邮件。另覆盖 HTTP 状态前缀容量错误及新原生 RGB 红色错误样式，普通网络错误不当作容量错误。
+- Rust 68 项、邮件 26 项、恢复状态机 15 项、PTY 15 项、请求提取 8 项、安装 3 项通过，共 135 项。恢复覆盖独立随机取样、同轮去重、跨前端认领和连续三次计数、自动消息不重置、手动/成功重置、paused/complete/blocked/未知 Goal、等待期间完成或替换、草稿及切换取消、确认前不发恢复邮件、中断不重放及持有邮件不被 retry 发送。另验证 watcher 退出后原 Codex 存活且持续显示通知不可用。
+- `tests/native_capacity.py` 在真实 0.162.1 共享与独立模式、0.162.0 共享模式通过：本地 SSE 容量错误后实际收到三次 `go on`，第四次仅有检查邮件。按原生轮次与消息记录断言次数，不把标题生成等辅助 HTTP 请求误算为任务重试。
+- 原生 `/goal` 创建没有普通消息 clientId；使用本前端 `/status` 确认真实 Session ID 后识别 Goal。容量失败原生状态实测为 blocked，正确发恢复受阻通知。随后通过原生 `/goal pause` 暂停，在隔离库注入新的结构化容量失败，验证实际 `/goal resume` 提交、产生新模型轮次并确认后发恢复邮件；不将 blocked 偷换成 paused。
+- 最终预编译包也通过 0.162.0 共享模式的完整真实恢复验证，并通过 PATH 不含 Python 的 helper、TLS SMTP、共享/独立容量、运行时恢复、去重及 FIFO 清理检查。安装更新继续验证配置、授权码及队列内容和权限保留。自动恢复依赖可读的 Goal/轮次状态；无法确认状态时不自动回复，exec 和远程 app-server 不在容量恢复验证范围。
+
 ## 2026-10-12：v0.2.3 安装区分与 Codex 0.162.0
 
 环境：Linux / WSL、glibc 2.35、打包 Python 3.10.12，独立下载 Codex CLI 0.162.0，复用现有 0.162.1 app-server。后台已有 `api_key_model_discovery=false`，测试客户端以 `--disable api_key_model_discovery` 对齐；未修改默认 Codex、共享 feature 配置或重启后台。不声称不同 feature 设置能无提示共用后台。

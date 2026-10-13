@@ -2,9 +2,11 @@
 use std::{
     env,
     ffi::OsString,
+    fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 pub struct Watcher {
@@ -12,10 +14,109 @@ pub struct Watcher {
     pub path: PathBuf,
 }
 
+impl Watcher {
+    pub fn running(&mut self) -> std::io::Result<bool> {
+        Ok(self.child.try_wait()?.is_none())
+    }
+
+    fn write_control(&self, name: &str, value: serde_json::Value) -> std::io::Result<()> {
+        let path = self.path.with_file_name(name);
+        let pending = path.with_extension("next");
+        fs::write(&pending, serde_json::to_vec(&value)?)?;
+        fs::rename(pending, path)
+    }
+
+    pub fn capacity(&self, pid: u32, generation: u64) -> std::io::Result<()> {
+        self.write_control(
+            "native-capacity.json",
+            serde_json::json!({
+                "pid": pid, "generation": generation,
+                "at": SystemTime::now().duration_since(UNIX_EPOCH)
+                    .map_err(std::io::Error::other)?.as_nanos().to_string(),
+            }),
+        )
+    }
+
+    pub fn frontend(&self, generation: u64, input_at_ms: u128, ready: bool) -> std::io::Result<()> {
+        self.write_control(
+            "frontend.json",
+            serde_json::json!({
+                "generation": generation, "input_at_ms": input_at_ms, "ready": ready,
+            }),
+        )
+    }
+
+    /// Called after reading human input and native output. Consume each command
+    /// once; the acknowledgment is written only after the PTY accepted its bytes.
+    pub fn recovery(
+        &self,
+        generation: u64,
+        ready: bool,
+        fd: i32,
+    ) -> std::io::Result<Option<(String, String)>> {
+        let path = self.path.with_file_name("recovery-request.json");
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let request: serde_json::Value = serde_json::from_slice(&bytes)?;
+        fs::remove_file(path)?;
+        let command = request["command"].as_str().unwrap_or_default();
+        let status = if ready
+            && request["generation"].as_u64() == Some(generation)
+            && matches!(command, "go on" | "/goal resume" | "/status")
+        {
+            let input = format!("\x1b[200~{command}\x1b[201~\r");
+            match crate::terminal::write(fd, input.as_bytes()) {
+                Ok(n) if n == input.len() => "written",
+                // Never replay an uncertain/partial submission.
+                _ => "unconfirmed",
+            }
+        } else {
+            "cancelled"
+        };
+        self.write_control(
+            "recovery-ack.json",
+            serde_json::json!({
+                "key": request["key"], "status": status,
+            }),
+        )?;
+        Ok((status == "written").then(|| {
+            (
+                request["key"].as_str().unwrap_or_default().to_owned(),
+                command.to_owned(),
+            )
+        }))
+    }
+
+    /// Follow a session explicitly confirmed in the native resume picker.
+    pub fn bind_session(
+        &self,
+        session: &str,
+        generation: u64,
+        identity: bool,
+    ) -> std::io::Result<()> {
+        let record = serde_json::to_vec(&serde_json::json!({
+            "dir": "codex24h", "kind": "resume", "session": session,
+            "generation": generation,
+            "since": if identity { 0 } else { SystemTime::now().duration_since(UNIX_EPOCH)
+                .map_err(std::io::Error::other)?.as_secs() },
+        }))?;
+        // Keep control records separate from Codex's potentially large FIFO
+        // writes: two pipe writers could interleave a JSON event mid-line.
+        let pending = self.path.with_file_name("scope.next");
+        fs::write(&pending, record)?;
+        fs::rename(pending, self.path.with_file_name("scope.json"))
+    }
+}
+
 impl Drop for Watcher {
     fn drop(&mut self) {
-        unsafe {
-            libc::kill(self.child.id() as i32, libc::SIGTERM);
+        if matches!(self.child.try_wait(), Ok(None)) {
+            unsafe {
+                libc::kill(self.child.id() as i32, libc::SIGTERM);
+            }
         }
         let _ = self.child.wait();
     }
@@ -74,10 +175,20 @@ pub fn arguments(
         let daemon = pty
             && String::from_utf8_lossy(&Command::new(exe).arg("--help").output()?.stdout)
                 .contains("--no-daemon");
-        if daemon
+        let shared = daemon
             && !crate::launch::has_option(&args, "--no-daemon")
-            && !crate::launch::has_option(&args, "--remote")
-        {
+            && !crate::launch::has_option(&args, "--remote");
+        if !shared {
+            let index = args
+                .iter()
+                .position(|arg| arg == "--")
+                .unwrap_or(args.len());
+            args.splice(
+                index..index,
+                [OsString::from("-c"), OsString::from(notification)],
+            );
+        }
+        if pty && !crate::launch::has_option(&args, "--remote") {
             let mut command = Command::new(&helper);
             command
                 .arg("watch")
@@ -86,6 +197,9 @@ pub fn arguments(
                 .arg("--codex-home")
                 .arg(&home)
                 .stdout(Stdio::piped());
+            if !shared {
+                command.arg("--standalone");
+            }
             if let Some(session) = crate::launch::resume_target(&args) {
                 command.arg("--session").arg(session);
             }
@@ -104,15 +218,6 @@ pub fn arguments(
                 }),
             ));
         }
-        // Last config override wins, but it must remain before a literal prompt delimiter.
-        let index = args
-            .iter()
-            .position(|arg| arg == "--")
-            .unwrap_or(args.len());
-        args.splice(
-            index..index,
-            [OsString::from("-c"), OsString::from(notification)],
-        );
     }
     Ok((args, None))
 }

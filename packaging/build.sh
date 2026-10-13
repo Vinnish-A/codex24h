@@ -13,7 +13,7 @@ python3 - "$project_dir/scripts" "$work_dir/helpers" <<'PYCOMPILE'
 from pathlib import Path
 import py_compile
 import sys
-for name in ('mail', 'attach', 'requests', 'session'):
+for name in ('mail', 'attach', 'requests', 'session', 'recovery'):
     source = Path(sys.argv[1], 'codex24h-' + name)
     py_compile.compile(str(source), cfile=str(Path(sys.argv[2], source.name)), doraise=True)
 PYCOMPILE
@@ -27,7 +27,7 @@ python3 -m PyInstaller --noconfirm --clean --onedir --strip \
     --hidden-import email.utils --hidden-import select --hidden-import signal \
     --hidden-import uuid --hidden-import subprocess --hidden-import tempfile \
     --hidden-import json --hidden-import shlex --hidden-import datetime \
-    --hidden-import contextlib --hidden-import shutil \
+    --hidden-import contextlib --hidden-import shutil --hidden-import random --hidden-import re \
     "$project_dir/packaging/helper.py"
 package_dir="$work_dir/dist/codex24h-helper"
 install -m 755 target/release/codex24h "$package_dir/codex24h"

@@ -235,6 +235,25 @@ class WrapperE2E(unittest.TestCase):
         self.wait_log("pid.log", b"\n")
         return int(self.log("pid.log").splitlines()[-1])
 
+    def test_mail_watcher_exit_keeps_codex_alive_and_reports_monitoring_loss(self):
+        config = Path(self.temp.name, "mail.toml")
+        config.write_text('enabled = true\nhost = "localhost"\nfrom = "test@example.com"\nto = ["test@example.com"]\nstate_dir = '+json.dumps(str(Path(self.temp.name, 'mail-state')))+'\n')
+        home = Path(self.temp.name, "codex-home")
+        home.mkdir()
+        terminal = Terminal(self.env | {"CODEX24H_MAIL":"1", "CODEX24H_MAIL_CONFIG":str(config), "CODEX_HOME":str(home)})
+        self.addCleanup(terminal.close)
+        terminal.until("READY-080")
+        children = Path(f"/proc/{terminal.process.pid}/task/{terminal.process.pid}/children").read_text().split()
+        watchers = [int(pid) for pid in children if b"watch" in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")]
+        self.assertEqual(len(watchers),1)
+        os.kill(watchers[0],signal.SIGTERM)
+        terminal.until("Mail / recovery unavailable")
+        self.assertIsNone(terminal.process.poll())
+        terminal.send(b"still running\n")
+        self.wait_log("stdin.bin", b"still running\n")
+        terminal.send(b":exit 0\n")
+        self.assertEqual(terminal.wait_draining(),0)
+
     def test_resume_requests_read_selected_shared_session_without_child_rollout(self):
         session = "00000000-0000-4000-8000-000000000001"
         home = Path(self.temp.name, "codex-home")

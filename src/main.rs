@@ -15,7 +15,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 fn main() {
@@ -79,7 +79,7 @@ fn run() -> Result<i32> {
     let reconnected = env::var_os("CODEX24H_RECONNECTED").is_some();
     let exe = launch::resolve_codex()?;
     let pty = terminal::is_tty(0) && terminal::is_tty(1) && launch::interactive(&args);
-    let (args, mail_watcher) = codex24h::mail::arguments(args, &exe, pty)?;
+    let (args, mut mail_watcher) = codex24h::mail::arguments(args, &exe, pty)?;
     if !pty {
         return Err(Command::new(exe).args(args).exec().into());
     }
@@ -116,6 +116,12 @@ fn run() -> Result<i32> {
         core.requests.pid = child.process_id();
         core.requests.session =
             launch::resume_target(&args).map(|s| s.to_string_lossy().into_owned());
+        let mut watched_session = core.requests.session.clone();
+        let mut input_generation = 0u64;
+        let mut input_at_ms = 0u128;
+        let mut published_frontend = None;
+        let mut status_probe: Option<(u64, Instant, Core)> = None;
+        let mut mail_fault = false;
         let mut router = Router::new();
         router.set_detachable(reconnected);
         let mut renderer = Renderer::new();
@@ -224,6 +230,14 @@ fn run() -> Result<i32> {
                 core.tick();
                 last_frame = now;
             }
+            if core.requests.session != watched_session {
+                if let (Some(watcher), Some(session)) = (&mail_watcher, &core.requests.session)
+                    && let Err(error) = watcher.bind_session(session, input_generation, false)
+                {
+                    eprintln!("codex24h-mail: cannot monitor resumed session: {error}");
+                }
+                watched_session = core.requests.session.clone();
+            }
             if child_pos == child_write.len() {
                 child_write.clear();
                 child_pos = 0;
@@ -240,6 +254,12 @@ fn run() -> Result<i32> {
                         || now.duration_since(last_draw) >= Duration::from_millis(250))
                 {
                     let mut frame = core.frame();
+                    if mail_fault {
+                        frame.status = format!(
+                            "Mail / recovery unavailable · reopen frontend · {}",
+                            frame.status
+                        );
+                    }
                     if let Some(code) = exit_code {
                         frame.status = format!(
                             "Codex exited ({code}) · q / Enter: close · Ctrl+] b: final screen"
@@ -309,6 +329,9 @@ fn run() -> Result<i32> {
                     Ok(0) => return Ok(exit_code.unwrap_or(0)),
                     Ok(n) => {
                         last_input = Instant::now();
+                        input_generation += 1;
+                        status_probe = None;
+                        input_at_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
                         urgent = true;
                         if buf[..n].contains(&b'\r') || buf[..n].contains(&b'\n') {
                             capacity_visible = false;
@@ -336,11 +359,25 @@ fn run() -> Result<i32> {
                             break;
                         }
                         Ok(n) => {
+                            if let Some((_, _, probe)) = &mut status_probe {
+                                probe.process(&buf[..n]);
+                            }
                             core.process(&buf[..n]);
+                            // Shared clients are monitored from scoped turn metadata;
+                            // their rollout belongs to the daemon, not this PTY child.
                             if let Some(capacity) = core.capacity_error() {
                                 if capacity && !capacity_visible {
                                     if let Some(pid) = child.process_id() {
-                                        codex24h::mail::capacity(pid);
+                                        if let Some(watcher) = &mail_watcher {
+                                            if !mail_fault
+                                                && watcher.capacity(pid, input_generation).is_err()
+                                            {
+                                                mail_fault = true;
+                                                core.dirty = true;
+                                            }
+                                        } else {
+                                            codex24h::mail::capacity(pid);
+                                        }
                                     }
                                 }
                                 capacity_visible = capacity;
@@ -369,6 +406,58 @@ fn run() -> Result<i32> {
                     Ok(n) => display_pos += n,
                     Err(e) if transient(&e) => {}
                     Err(e) => return Err(e.into()),
+                }
+            }
+            if !mail_fault && let Some(watcher) = &mut mail_watcher {
+                let monitored = (|| -> io::Result<()> {
+                    if !watcher.running()? {
+                        return Err(io::Error::other("mail watcher exited"));
+                    }
+                    let ready = exit_code.is_none()
+                        && child_pos == child_write.len()
+                        && core.pty_out.is_empty()
+                        && !router.has_pending()
+                        && core.recovery_ready();
+                    let frontend = (input_generation, input_at_ms, ready);
+                    if published_frontend != Some(frontend) {
+                        watcher.frontend(input_generation, input_at_ms, ready)?;
+                        published_frontend = Some(frontend);
+                    }
+                    if let Some((_, command)) = watcher.recovery(input_generation, ready, fd)?
+                        && command == "/status"
+                    {
+                        status_probe = Some((
+                            input_generation,
+                            Instant::now(),
+                            Core::new(core.size, 500, false, caps.foreground, caps.background),
+                        ));
+                    }
+                    if let Some((generation, since, probe)) = &status_probe {
+                        if *generation == input_generation
+                            && since.elapsed() >= Duration::from_millis(300)
+                            && let Some(session) = probe.status_session()
+                        {
+                            watcher.bind_session(&session, input_generation, true)?;
+                            core.requests.bind_session(Some(session));
+                            watched_session = core.requests.session.clone();
+                            status_probe = None;
+                        } else if since.elapsed() > Duration::from_secs(5) {
+                            status_probe = None;
+                            eprintln!(
+                                "codex24h-mail: native status did not confirm the current Goal session; automatic recovery is disabled for this request"
+                            );
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = monitored {
+                    mail_fault = true;
+                    status_probe = None;
+                    core.dirty = true;
+                    urgent = true;
+                    eprintln!(
+                        "codex24h-mail: monitoring stopped ({error}); Codex remains running; reopen the frontend to restore notifications"
+                    );
                 }
             }
         }

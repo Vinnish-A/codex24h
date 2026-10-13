@@ -19,6 +19,7 @@ import ssl
 import subprocess
 import sys
 import runpy
+import re
 import select
 import signal
 import tempfile
@@ -231,8 +232,9 @@ def prepare(args):
     print('notify=' + json.dumps(command, ensure_ascii=False))
 
 
-def enqueue(cfg, config, home, since, event):
-    if event.get('type') != 'agent-turn-complete':
+def enqueue(cfg, config, home, since, event, hold=False):
+    kind = event.get('type')
+    if kind not in ('agent-turn-complete', 'model_capacity'):
         return None
     session, turn = event.get('thread-id'), event.get('turn-id')
     for value in (session, turn):
@@ -242,26 +244,34 @@ def enqueue(cfg, config, home, since, event):
     if meta['subagent'] is not False:
         return None
     scope = str(Path(config).resolve())
-    key = hashlib.sha256((scope + '\0' + session + '\0' + turn).encode()).hexdigest()
+    capacity = kind == 'model_capacity'
+    key = hashlib.sha256((scope + '\0' + session + ('\0capacity' if capacity else '') + '\0' + turn).encode()).hexdigest()
     payload = {'session': session, 'turn': turn, 'name': meta['name'],
                'completed_at': time.time_ns() // 1_000_000, 'goal_completed': False,
                'codex_home': str(Path(home).resolve())}
+    if capacity:
+        payload['type'] = 'model_capacity'
     with database(cfg) as conn:
         conn.execute('BEGIN IMMEDIATE')
         if conn.execute('SELECT 1 FROM jobs WHERE key=?', (key,)).fetchone():
             return key
         goal = meta['goal']
-        if goal and goal['status'] == 'complete' and goal['updated'] >= since:
+        if not capacity and goal and goal['status'] == 'complete' and goal['updated'] >= since:
             goal_key = scope + '\0' + goal['id']
             inserted = conn.execute('INSERT OR IGNORE INTO goals VALUES (?,?)', (goal_key, key)).rowcount
             payload['goal_completed'] = bool(inserted)
-        conn.execute('INSERT INTO jobs(key,config,payload,state) VALUES (?,?,?,?)', (key, scope, json.dumps(payload, ensure_ascii=False), 'pending'))
+        conn.execute('INSERT INTO jobs(key,config,payload,state) VALUES (?,?,?,?)', (key, scope, json.dumps(payload, ensure_ascii=False), 'recovering' if hold else 'pending'))
+        if hold:
+            conn.execute('INSERT INTO capacity_claims VALUES (?,?,?)', (key, hold, 'wait'))
         conn.commit()
     return key
 
 
 def mail_message(cfg, key, payload):
     kind = '模型容量不足' if payload.get('type') == 'model_capacity' else ('Goal 已完成' if payload['goal_completed'] else '本轮已完成')
+    if payload.get('recovery'):
+        kind = {'submitted':'自动恢复请求已提交', 'exhausted':'容量不足，请检查',
+                'blocked':'模型容量不足：自动恢复受阻', 'skipped':'容量事件：无需恢复'}[payload['recovery']]
     message = EmailMessage()
     message['From'], message['To'] = cfg['from'], ', '.join(cfg['to'])
     message['Subject'] = f'[Codex24h][{kind}] {payload["name"]}'
@@ -270,7 +280,8 @@ def mail_message(cfg, key, payload):
     message['Message-ID'] = f'<{key}@codex24h.local>'
     trigger = ('原生模型容量错误' if payload.get('type') == 'model_capacity' else 'Codex 原生完成事件')
     time_label = '发生时间' if payload.get('type') == 'model_capacity' else '完成时间'
-    message.set_content(f'{kind}\n\n会话：{payload["name"]}\nSession ID：{payload["session"]}\n'
+    detail = payload.get('recovery_detail', '')
+    message.set_content(f'{kind}\n{detail}\n\n会话：{payload["name"]}\nSession ID：{payload["session"]}\n'
                         f'Turn ID：{payload["turn"]}\n{time_label}：{when.isoformat()}\n\n'
                         f'恢复会话：\ncodex24h resume {shlex.quote(payload["session"])}\n\n'
                         f'此邮件由{trigger}自动触发，未调用模型生成或发送。\n')
@@ -310,7 +321,7 @@ def worker(config, key):
             return
         with database(cfg) as conn:
             row = conn.execute('SELECT payload,state FROM jobs WHERE key=? AND config=?', (key, str(Path(config).resolve()))).fetchone()
-            if not row or row[1] in ('sent', 'suppressed'):
+            if not row or row[1] not in ('pending', 'failed', 'sending'):
                 return
             payload = json.loads(row[0])
         for attempt in range(2):
@@ -395,6 +406,21 @@ class CompletionWatch:
             pass
 
     def record(self, record):
+        if record.get('dir') == 'codex24h' and record.get('kind') == 'resume':
+            lookup = runpy.run_path(str(Path(__file__).with_name('codex24h-requests')))
+            try:
+                session = lookup['resolve_session'](self.home, record['session'])
+                if session not in self.sessions:
+                    path = self.home/'thread_history_1.sqlite'
+                    if path.exists():
+                        with contextlib.closing(sqlite3.connect(path.resolve().as_uri()+'?mode=ro', uri=True, timeout=.5)) as conn:
+                            self.seen.update((session, row[0]) for row in conn.execute(
+                                "SELECT turn_id FROM thread_turns WHERE thread_id=? AND status IN ('completed','failed') AND completed_at<?",
+                                (session, record['since'])))
+                    self.sessions.add(session)
+            except (ValueError, RuntimeError, sqlite3.Error) as error:
+                print(f'codex24h-mail: cannot bind resumed session: {type(error).__name__}', file=sys.stderr)
+            return
         if record.get('dir') != 'from_tui' or record.get('kind') != 'op':
             return
         payload = record.get('payload', {})
@@ -404,6 +430,7 @@ class CompletionWatch:
             self.messages.add(message)
 
     def completed(self, initial=False):
+        """Return this frontend's completed turns and structured capacity failures."""
         path = self.home/'thread_history_1.sqlite'
         if not path.exists():
             return []
@@ -411,20 +438,33 @@ class CompletionWatch:
         with contextlib.closing(sqlite3.connect(path.resolve().as_uri()+'?mode=ro', uri=True, timeout=.5)) as conn:
             for message in list(self.messages):
                 row = conn.execute(
-                    "SELECT thread_id FROM thread_items WHERE item_type='userMessage' AND created_at_ms>=? AND json_extract(item_json,'$.clientId')=?",
-                    (self.since, message)).fetchone()
+                    "SELECT thread_id FROM thread_items WHERE item_type='userMessage' AND json_extract(item_json,'$.clientId')=?",
+                    (message,)).fetchone()
                 if row:
                     self.sessions.add(row[0])
                     self.messages.remove(message)
+            # Older history schemas can lack structured errors; completion
+            # notifications still work there, without guessing failure text.
+            columns = {row[1] for row in conn.execute('PRAGMA table_info(thread_turns)')}
+            error_column = 'error_json' if 'error_json' in columns else 'NULL'
             for session in self.sessions:
-                for turn, completed in conn.execute(
-                    "SELECT turn_id,completed_at FROM thread_turns WHERE thread_id=? AND status='completed' AND completed_at>=?",
+                for turn, status, raw_error in conn.execute(
+                    f"SELECT turn_id,status,{error_column} FROM thread_turns WHERE thread_id=? AND status IN ('completed','failed') AND completed_at>=?",
                     (session, self.since//1000)):
+                    kind = 'agent-turn-complete'
+                    if status == 'failed':
+                        error = json.loads(raw_error) if raw_error else {}
+                        message = error.get('message', '').strip().casefold()
+                        if (error.get('codexErrorInfo') != 'serverOverloaded'
+                                and not message.startswith('server_overloaded')
+                                and not re.search(r'(?:^|:\s+)(?:the )?(?:selected|loaded) model is at capacity\b', message)):
+                            continue
+                        kind = 'model_capacity'
                     key = (session, turn)
                     if key not in self.seen:
                         self.seen.add(key)
                         if not initial:
-                            found.append({'type': 'agent-turn-complete', 'thread-id': session, 'turn-id': turn})
+                            found.append({'type': kind, 'thread-id': session, 'turn-id': turn})
         return found
 
 
@@ -441,13 +481,28 @@ def watch(args):
             print(path, flush=True)
             pending = b''
             reported = False
+            scope_path = Path(directory)/'scope.json'
+            scope = None
+            recovery_module = runpy.run_path(str(Path(__file__).with_name('codex24h-recovery')))
+            recovery = recovery_module['Recovery'](globals(), cfg, args, directory, observer)
             while True:
+                if scope_path.exists():
+                    selected = scope_path.read_bytes()
+                    if selected != scope:
+                        record = json.loads(selected)
+                        observer.record(record)
+                        recovery.record(record)
+                        scope = selected
                 if select.select([fd], [], [], .25)[0]:
                     pending += os.read(fd, 65536)
                     while b'\n' in pending:
                         line, pending = pending.split(b'\n', 1)
-                        observer.record(json.loads(line))
+                        record = json.loads(line)
+                        observer.record(record)
+                        recovery.record(record)
+                recovery.native_capacity()
                 try:
+                    recovery.tick()
                     events = observer.completed()
                 except sqlite3.Error:
                     if not reported:
@@ -455,11 +510,37 @@ def watch(args):
                         reported = True
                     continue
                 for event in events:
-                    key = enqueue(cfg, args.config, args.codex_home, observer.since, event)
-                    if key:
-                        spawn_worker(args.config, key)
+                    if event['type'] == 'model_capacity':
+                        recovery.capacity(event)
+                    else:
+                        if recovery.latest(event['thread-id']) == (event['turn-id'], 'completed'):
+                            recovery.reset(event['thread-id'])
+                        if args.standalone:
+                            continue
+                        key = enqueue(cfg, args.config, args.codex_home, observer.since, event)
+                        if key:
+                            spawn_worker(args.config, key)
+                recovery.tick()
         finally:
             os.close(fd)
+
+
+def owned_capacity(home, pid):
+    lookup = runpy.run_path(str(Path(__file__).with_name('codex24h-requests')))
+    path = lookup['rollout'](pid, home)
+    turn = None
+    with path.open() as stream:
+        record = json.loads(stream.readline())
+        session = record['payload']['id']
+        for line in stream:
+            if not line.endswith('\n'):
+                break
+            if '"turn_started"' in line or '"turn_context"' in line:
+                row = json.loads(line)
+                event = row.get('payload', {})
+                if (row.get('type') == 'event_msg' and event.get('type') == 'turn_started') or row.get('type') == 'turn_context':
+                    turn = event.get('turn_id') or turn
+    return session, turn
 
 
 def main():
@@ -481,6 +562,7 @@ def main():
             sub.add_argument('event')
         if name == 'watch':
             sub.add_argument('--session')
+            sub.add_argument('--standalone', action='store_true')
         if name == 'worker':
             sub.add_argument('key')
     args = parser.parse_args()
@@ -503,21 +585,8 @@ def main():
             print('Email notifications are disabled.')
             return
         if args.command == 'capacity':
-            lookup = runpy.run_path(str(Path(__file__).with_name('codex24h-requests')))
             home = Path(os.environ.get('CODEX_HOME', str(Path.home()/'.codex')))
-            path = lookup['rollout'](args.pid, home)
-            turn = None
-            with path.open() as stream:
-                record = json.loads(stream.readline())
-                session = record['payload']['id']
-                for line in stream:
-                    if not line.endswith('\n'):
-                        break
-                    if '"turn_started"' in line or '"turn_context"' in line:
-                        row = json.loads(line)
-                        event = row.get('payload', {})
-                        if (row.get('type') == 'event_msg' and event.get('type') == 'turn_started') or row.get('type') == 'turn_context':
-                            turn = event.get('turn_id') or turn
+            session, turn = owned_capacity(home, args.pid)
             meta = metadata(home, session)
             if meta['subagent'] is not False:
                 return
@@ -559,7 +628,7 @@ def main():
                     for key, state, attempts, error in conn.execute('SELECT key,state,attempts,error FROM jobs WHERE config=? ORDER BY rowid DESC LIMIT 20', (str(args.config.resolve()),)):
                         print(f'{key[:12]}  {state:8}  attempts={attempts}  {error or ""}')
                 else:
-                    keys = [row[0] for row in conn.execute("SELECT key FROM jobs WHERE state NOT IN ('sent','suppressed') AND config=?", (str(args.config.resolve()),))]
+                    keys = [row[0] for row in conn.execute("SELECT key FROM jobs WHERE state IN ('pending','failed','sending') AND config=?", (str(args.config.resolve()),))]
                     for key in keys:
                         worker(args.config, key)
                     print(f'Processed {len(keys)} queued deliveries; run status for results.')

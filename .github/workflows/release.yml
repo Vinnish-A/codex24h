@@ -17,6 +17,11 @@ jobs:
       - run: cargo test --locked
       - run: python tests/install.py
       - run: bash packaging/build.sh
+      - name: Test mail scope and request metadata
+        run: |
+          CODEX24H_TEST_BIN="$PWD/target/release/codex24h" python tests/mail.py
+          python tests/requests.py
+          python tests/recovery.py
       - name: Smoke test standalone helpers
         run: |
           mkdir -p /tmp/codex24h-release-smoke

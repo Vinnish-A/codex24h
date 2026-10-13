@@ -1,17 +1,15 @@
-Linux x86_64 / WSL 预编译版本（glibc 2.35+，例如 Ubuntu 22.04+）。
+Linux x86_64 / WSL 容量检测与自动恢复（glibc 2.35+）。
 
-- 一键脚本区分首次安装、版本更新、同版本刷新命令入口和旧源码安装升级；版本更新显示旧、新版本。保留邮件配置、SMTP 授权码和发信队列，无需重新配置邮箱。
-- 修复普通 `codex24h resume SESSION_UUID` 在共享模式下请求列表为空的问题，按目标 UUID 读取共享历史，必要时读取该会话日志。
-- 修复空会话内 `/resume` 以及再次切换会话后的请求检索。列表跟随原生选择器确认的会话，并清除旧缓存；窄窗口中的截断 UUID 仅在唯一匹配时使用。原生 agents 和 `/new` 切换仍不在自动跟踪范围内。
-- 增加 Codex CLI **0.162.0** 实机验证：恢复会话、原生 agents、Tab 补全、完成邮件和请求检索。保留原先已验证的 0.158.0、0.159.2、0.160.0。
-- 适配全文搜索的 `enter accept` 页脚，解决定位完成后仍显示 searching、滚动等待不释放的问题，继续支持旧版页脚。
+- 修复共享后台下界面显示 capacity 却无邮件的问题：按当前前端确认会话的结构化失败轮次识别，不再要求前端持有日志。
+- 每次容量错误独立随机等待 3～10 秒。普通任务自动提交 `go on`；仅 paused Goal 提交 `/goal resume`，complete / achieved 不恢复。新建 Goal 通过本前端原生 `/status` 确认 Session ID，再读取状态。
+- Codex 确认接收后发送“自动恢复请求已提交”邮件。每会话连续最多三次，第四次仅发“容量不足，请检查”；成功或手动新请求重置，自动回复与重复报错不重置。
+- 有草稿、输入、会话切换或状态不明时不盲发；恢复中断不重放指令。邮件重试仅重发邮件。保留主会话归属过滤、隐私与 SMTP TLS 校验。
+- `/resume` 同步监控目标。共享及独立模式均用真实 Codex 配合本地模拟容量错误和 TLS SMTP 验证；安装更新继续保留已有邮件配置、授权码和队列。
 
-0.162.0 验证复用本机 0.162.1 app-server，以 `--disable api_key_model_discovery` 对齐已有后台的 false 设置，未重启后台。包装器不自行更改后台共享 feature；设置不一致时仍由原生 Codex 提示处理。验证组合与范围见 [测试记录](https://github.com/Vinnish-A/codex24h/blob/main/TESTING.md)。
-
-安装或更新：
+更新：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Vinnish-A/codex24h/main/install.sh | bash
 ```
 
-脚本下载最新已发布的 Release。预编译包不要求用户安装 Rust、Python 或 pip，继续使用本机选定的 Codex 和已有登录。
+更新后重新打开 `codex24h` 或 `codex24h resume SESSION_UUID` 加载新功能，无需重启共享后台。`exec` 和远程 app-server 尚不支持容量自动恢复。
