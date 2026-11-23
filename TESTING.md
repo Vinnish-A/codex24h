@@ -1,5 +1,15 @@
 # 本机验证记录
 
+## 2026-11-08：v0.2.5 邮件数据库目录兼容
+
+环境：Linux / WSL，真实 Codex 0.167.0，打包 Python 3.10.12。使用隔离 CODEX_HOME、独立数据库目录和专用后台，模型响应来自本机模拟 SSE，邮件仅投递至临时 TLS SMTP。
+
+- 根因：邮件与恢复监控固定读取 CODEX_HOME 下的 SQLite；配置 `sqlite_home` 后仍查询旧库，导致完成邮件不入队。修复后统一读取选定目录，保留启动时目录供发信前归属复查。
+- Rust 68 项、邮件 28 项、恢复状态机 16 项和安装 3 项通过。新增配置/profile/命令行与环境变量优先级、迁移目录下的完成与 Goal 标记、旧目录归属不覆盖新库、异步 worker 保留目录、paused Goal 容量恢复测试。
+- 预编译包在真实 0.167.0 上通过独立数据库目录下的 exec 与共享 TUI 完成通知；`tests/native_capacity.py --relocated-sqlite` 通过三次自动恢复、第四次检查通知及原生 paused Goal 恢复。
+- 预编译包的无 Python PATH、TLS SMTP、共享完成/容量、运行时 resume、FIFO 清理、去重和独立容量回归通过。
+- 同一预编译包在远端 Linux / Codex 0.167.0 上再次通过隔离的 exec、共享 TUI 完成通知，以及共享/独立模式的容量与 Goal 恢复；测试使用迁移后的数据库目录、本机模拟 SSE 与 TLS SMTP，不发外部邮件，不重启生产后台。
+
 ## 2026-10-13：v0.2.4 容量检测与随机自动恢复
 
 环境：Linux / WSL、打包 Python 3.10.12，真实 Codex CLI / app-server 0.162.0、0.162.1。模型错误由隔离的本机 SSE 服务返回，邮件只投递至临时 TLS SMTP。测试使用临时 CODEX_HOME 和专用后台，不重启生产后台，不发送业务请求或外部邮件。

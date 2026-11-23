@@ -46,7 +46,9 @@ try:
             msg = BytesParser(policy=policy.default).parsebytes(message_bytes())
             assert '本轮已完成' in str(msg['Subject'])
             assert '中文项目会话' in str(msg['Subject'])
-            assert 'PRIVATE' not in msg.get_content()
+            assert msg.get_content().splitlines()[:3] == ['PRIVATE PROMPT', '', '本轮已完成']
+            assert 'PRIVATE ANSWER' not in msg.get_content()
+            assert '自动触发' not in msg.get_content()
             subprocess.run(args, env=env, check=True, timeout=5)
             assert server.messages.empty(), 'duplicate completion delivery'
             # The new shared-mode adapter must also work inside the bundled runtime.
@@ -55,7 +57,7 @@ try:
                 conn.execute('INSERT INTO threads VALUES (?,?,?,?)', (session, '共享模式测试', 'test', 'cli'))
             with sqlite3.connect(case.home/'thread_history_1.sqlite') as conn:
                 conn.execute('CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,status TEXT,completed_at INTEGER,error_json TEXT)')
-                conn.execute('CREATE TABLE thread_items(thread_id TEXT,item_type TEXT,created_at_ms INTEGER,item_json TEXT)')
+                conn.execute('CREATE TABLE thread_items(thread_id TEXT,turn_id TEXT,item_type TEXT,rollout_ordinal INTEGER,item_json TEXT)')
             watcher = subprocess.Popen([helper, 'watch', '--config', str(case.config), '--codex-home', str(case.home)],
                                        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             pipe = None
@@ -63,8 +65,9 @@ try:
                 pipe = Path(watcher.stdout.readline().strip())
                 assert stat.S_ISFIFO(pipe.stat().st_mode), 'event recording must be a FIFO'
                 with sqlite3.connect(case.home/'thread_history_1.sqlite') as conn:
-                    conn.execute('INSERT INTO thread_items VALUES (?,?,?,?)',
-                                 (session, 'userMessage', int(time.time()*1000), json.dumps({'clientId':'bundle-message'})))
+                    conn.execute('INSERT INTO thread_items VALUES (?,?,?,?,?)',
+                                 (session, 'bundle-turn', 'userMessage', 1, json.dumps({
+                                     'clientId':'bundle-message', 'content':[{'type':'text','text':'共享请求正文'}]})))
                     conn.execute('INSERT INTO thread_turns(thread_id,turn_id,status,completed_at) VALUES (?,?,?,?)',
                                  (session, 'bundle-turn', 'completed', int(time.time())))
                 event = {'dir':'from_tui', 'kind':'op', 'payload':{'UserTurn':{
@@ -74,6 +77,7 @@ try:
                 msg = BytesParser(policy=policy.default).parsebytes(message_bytes())
                 assert session in msg.get_content()
                 assert '共享模式测试' in str(msg['Subject'])
+                assert msg.get_content().splitlines()[:3] == ['共享请求正文', '', '本轮已完成']
                 assert 'PRIVATE' not in msg.get_content()
                 with pipe.open('w') as stream:
                     stream.write(json.dumps(event)+'\n')
@@ -175,7 +179,7 @@ pipe=Path(os.environ['CODEX_TUI_SESSION_LOG_PATH'])
 def fail(target, turn, client=None):
     with sqlite3.connect(home/'thread_history_1.sqlite') as conn:
         if client:
-            conn.execute('INSERT INTO thread_items VALUES (?,?,?,?)', (target,'userMessage',int(time.time()*1000),json.dumps({'clientId':client})))
+            conn.execute('INSERT INTO thread_items VALUES (?,?,?,?,?)', (target,turn,'userMessage',0,json.dumps({'clientId':client})))
         conn.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)', (target,turn,'failed',int(time.time()),json.dumps({'message':'Selected model is at capacity','codexErrorInfo':'serverOverloaded'})))
     if client:
         with pipe.open('w') as stream:

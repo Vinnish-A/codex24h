@@ -110,7 +110,7 @@ class MailTests(unittest.TestCase):
             payload, state, attempts, error = conn.execute('SELECT payload,state,attempts,error FROM jobs WHERE key=?', (key,)).fetchone()
             return json.loads(payload), state, attempts, error
 
-    def test_goal_marked_once_and_payload_contains_no_chat(self):
+    def test_goal_marked_once_and_email_includes_user_prompt(self):
         with sqlite3.connect(self.home / 'goals_1.sqlite') as conn:
             conn.execute('INSERT INTO thread_goals VALUES (?,?,?,?)', ('session-1','goal-1','complete',150))
         key = self.enqueue()
@@ -123,7 +123,8 @@ class MailTests(unittest.TestCase):
         message = mail.mail_message(self.cfg, key, payload)
         self.assertIn('Goal 已完成', str(message['Subject']))
         self.assertIn('中文项目会话', str(message['Subject']))
-        self.assertNotIn('PRIVATE', message.as_string())
+        self.assertTrue(message.get_content().startswith('PRIVATE PROMPT\n\nGoal 已完成\n'))
+        self.assertNotIn('PRIVATE ANSWER', message.get_content())
         self.assertIn('codex24h resume session-1', message.get_content())
 
     def test_capacity_mail_is_not_labelled_completed_or_goal(self):
@@ -141,11 +142,61 @@ class MailTests(unittest.TestCase):
             conn.execute('INSERT INTO thread_goals VALUES (?,?,?,?)', ('session-1','old','complete',99))
         self.assertFalse(self.job(self.enqueue())[0]['goal_completed'])
 
+    def test_sqlite_home_precedence_and_profile_overrides(self):
+        configured = self.base/'configured'
+        environment = self.base/'environment'
+        profile = self.base/'profile'
+        override = self.base/'override'
+        with patch.dict(os.environ, {'CODEX_SQLITE_HOME': str(environment)}):
+            self.assertEqual(mail.sqlite_home(self.home), environment)
+            (self.home/'config.toml').write_text(f'sqlite_home = {json.dumps(str(configured))}\n')
+            self.assertEqual(mail.sqlite_home(self.home), configured)
+            (self.home/'work.config.toml').write_text(f'sqlite_home = {json.dumps(str(profile))}\n')
+            self.assertEqual(mail.sqlite_home(self.home, ['-p', 'work']), profile)
+            self.assertEqual(mail.sqlite_home(self.home, ['-p', 'work', '-c',
+                f'sqlite_home={json.dumps(str(override))}']), override)
+
+    def test_relocated_sqlite_completion_goal_and_worker_ownership(self):
+        root = self.base/'sqlite'; root.mkdir()
+        for path in self.home.glob('*.sqlite'):
+            path.rename(root/path.name)
+        (self.home/'config.toml').write_text(f'sqlite_home = {json.dumps(str(root))}\n')
+        # A stale default database must not override ownership in the active store.
+        with sqlite3.connect(self.home/'state_5.sqlite') as conn:
+            conn.execute('CREATE TABLE threads(id TEXT,name TEXT,title TEXT,source TEXT)')
+            conn.execute('INSERT INTO threads VALUES (?,?,?,?)', ('session-1', '', '', 'subagent'))
+        with sqlite3.connect(root/'thread_history_1.sqlite') as conn:
+            conn.execute('CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,status TEXT,completed_at INTEGER)')
+            conn.execute('CREATE TABLE thread_items(thread_id TEXT,item_type TEXT,item_json TEXT)')
+        observer = mail.CompletionWatch(self.home)
+        observer.record({'dir':'from_tui','kind':'op','payload':{'UserTurn':{
+            'client_user_message_id':'relocated-message'}}})
+        with sqlite3.connect(root/'thread_history_1.sqlite') as conn:
+            conn.execute('INSERT INTO thread_items VALUES (?,?,?)',
+                         ('session-1','userMessage',json.dumps({'clientId':'relocated-message'})))
+            conn.execute('INSERT INTO thread_turns VALUES (?,?,?,?)',
+                         ('session-1','relocated-turn','completed',int(time.time())))
+        with sqlite3.connect(root/'goals_1.sqlite') as conn:
+            conn.execute('INSERT INTO thread_goals VALUES (?,?,?,?)',
+                         ('session-1','relocated-goal','complete',observer.since+1))
+        events = observer.completed()
+        self.assertEqual(len(events), 1)
+        key = mail.enqueue(self.cfg, self.config, self.home, observer.since, events[0], sqlite=observer.sqlite_home)
+        self.assertTrue(self.job(key)[0]['goal_completed'])
+        self.assertEqual(self.job(key)[0]['sqlite_home'], str(root))
+        # Workers retain the launch's store even if a later launch changes config.
+        (self.home/'config.toml').write_text('')
+        with patch.object(mail, 'deliver') as deliver:
+            mail.worker(self.config, key)
+        deliver.assert_called_once()
+        self.assertEqual(self.job(key)[1], 'sent')
+        self.assertEqual(observer.completed(), [])
+
     def test_shared_watch_scopes_completion_to_tui_message_and_deduplicates(self):
         history = self.home/'thread_history_1.sqlite'
         with sqlite3.connect(history) as conn:
             conn.execute('CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,first_user_item_id TEXT,status TEXT,completed_at INTEGER)')
-            conn.execute('CREATE TABLE thread_items(thread_id TEXT,item_type TEXT,created_at_ms INTEGER,item_json TEXT)')
+            conn.execute('CREATE TABLE thread_items(thread_id TEXT,turn_id TEXT,item_type TEXT,rollout_ordinal INTEGER,item_json TEXT)')
             conn.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)',
                          ('other-session','other-turn','other-message','completed',int(time.time())))
         observer = mail.CompletionWatch(self.home)
@@ -153,15 +204,31 @@ class MailTests(unittest.TestCase):
             'client_user_message_id':'my-message','items':[{'text':'PRIVATE PROMPT'}]}}})
         self.assertEqual(observer.completed(), [])
         with sqlite3.connect(history) as conn:
-            conn.execute('INSERT INTO thread_items VALUES (?,?,?,?)',
-                         ('session-1','userMessage',int(time.time()*1000),json.dumps({'clientId':'my-message','content':'PRIVATE PROMPT'})))
+            def item(session, turn, ordinal, text, item_type='userMessage', client_id=None):
+                return (session, turn, item_type, ordinal, json.dumps({
+                    'clientId': client_id, 'content': [{'type':'text','text':text}]}))
+            conn.executemany('INSERT INTO thread_items VALUES (?,?,?,?,?)', [
+                item('session-1', 'turn-1', 1, 'FIRST PROMPT', client_id='my-message'),
+                item('session-1', 'turn-1', 2, '最新请求\n  保留缩进'),
+                item('session-1', 'turn-1', 3, 'ASSISTANT RESPONSE', item_type='agentMessage'),
+                item('session-1', 'aborted', 4, 'OTHER TURN PROMPT'),
+                item('other-session', 'turn-1', 5, 'OTHER SESSION PROMPT'),
+            ])
             conn.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)',
                          ('session-1','turn-1','my-message','completed',int(time.time())))
             conn.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)',
                          ('session-1','aborted','my-aborted','interrupted',int(time.time())))
-        self.assertEqual(observer.completed(), [
+        events = observer.completed()
+        self.assertEqual(events, [
             {'type':'agent-turn-complete','thread-id':'session-1','turn-id':'turn-1'}])
         self.assertEqual(observer.completed(), [])
+        key = mail.enqueue(self.cfg, self.config, self.home, observer.since, events[0], sqlite=observer.sqlite_home)
+        with patch.object(mail, 'deliver') as deliver:
+            mail.worker(self.config, key)
+        body = deliver.call_args.args[1].get_content()
+        self.assertTrue(body.startswith('最新请求\n  保留缩进\n\n本轮已完成\n'))
+        self.assertNotIn('PROMPT', body)
+        self.assertNotIn('ASSISTANT RESPONSE', body)
 
     def test_shared_resume_ignores_completed_history_but_watches_active_turn(self):
         session = '11111111-1111-4111-8111-111111111111'
@@ -476,7 +543,10 @@ class MailTests(unittest.TestCase):
             message = BytesParser(policy=policy.default).parsebytes(raw)
             self.assertIn('中文项目会话',str(message['Subject']))
             self.assertIn('本轮已完成',str(message['Subject']))
-            self.assertNotIn('PRIVATE',message.get_content())
+            body = message.get_content()
+            self.assertEqual(body.splitlines()[:3], ['PRIVATE PROMPT', '', '本轮已完成'])
+            self.assertNotIn('PRIVATE ANSWER', body)
+            self.assertNotIn('自动触发', body)
             key = self.enqueue()
             end = time.monotonic()+3
             while self.job(key)[1] != 'sent' and time.monotonic()<end:

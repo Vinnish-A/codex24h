@@ -120,11 +120,17 @@ def database(cfg):
         conn.close()
 
 
-def metadata(home, session):
+def sqlite_home(home, args=()):
+    cfg = codex_config(home, args)
+    return Path(cfg.get('sqlite_home') or os.environ.get('CODEX_SQLITE_HOME') or home).expanduser().resolve()
+
+
+def metadata(home, session, sqlite=None):
     """Read metadata only; never scan or interpret the conversation text."""
     # Unknown ownership must never be treated as a main session.
     result = {'name': session, 'subagent': None, 'goal': None}
-    paths = sorted(Path(home).glob('state_*.sqlite'),
+    root = Path(sqlite) if sqlite is not None else sqlite_home(home)
+    paths = sorted(root.glob('state_*.sqlite'),
                    key=lambda p: int(p.stem.split('_')[-1]) if p.stem.split('_')[-1].isdigit() else -1,
                    reverse=True)
     # The newest schema is authoritative; older databases can contain stale sources.
@@ -149,7 +155,7 @@ def metadata(home, session):
                     break
         except sqlite3.Error:
             continue
-    path = Path(home) / 'goals_1.sqlite'
+    path = root / 'goals_1.sqlite'
     if path.exists():
         try:
             with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=.5)) as conn:
@@ -170,7 +176,7 @@ def merge(base, patch):
             base[key] = value
 
 
-def previous_notify(home, args):
+def codex_config(home, args):
     base_path = Path(home) / 'config.toml'
     base = read_toml(base_path) if base_path.exists() else {}
     overrides, profile = {}, None
@@ -211,6 +217,11 @@ def previous_notify(home, args):
         if profile_file.exists():
             merge(base, read_toml(profile_file))
     merge(base, overrides)
+    return base
+
+
+def previous_notify(home, args):
+    base = codex_config(home, args)
     command = base.get('notify', [])
     if not isinstance(command, list) or any(not isinstance(x, str) for x in command):
         raise ValueError('existing Codex notify must be an array of strings')
@@ -226,13 +237,38 @@ def prepare(args):
     password(cfg)  # Fail before entering raw terminal mode if credentials are unavailable.
     previous = previous_notify(args.codex_home, args.args)
     command = [*helper_command(), 'notify', '--config', str(Path(args.config).resolve()),
-               '--codex-home', str(Path(args.codex_home).resolve()), '--since', str(time.time_ns() // 1_000_000),
+               '--codex-home', str(Path(args.codex_home).resolve()),
+               '--sqlite-home', str(sqlite_home(args.codex_home, args.args)),
+               '--since', str(time.time_ns() // 1_000_000),
                '--previous', json.dumps(previous)]
     # JSON's string-array syntax is valid TOML for these paths and command arguments.
     print('notify=' + json.dumps(command, ensure_ascii=False))
 
 
-def enqueue(cfg, config, home, since, event, hold=False):
+def completion_prompt(root, event):
+    # The native callback supplies user text directly. Shared mode has only IDs.
+    for text in reversed(event.get('input-messages') or []):
+        if isinstance(text, str) and text.strip():
+            return text
+    path = root / 'thread_history_1.sqlite'
+    try:
+        with contextlib.closing(sqlite3.connect(path.resolve().as_uri()+'?mode=ro', uri=True, timeout=.5)) as conn:
+            for (raw,) in conn.execute(
+                "SELECT item_json FROM thread_items WHERE thread_id=? AND turn_id=? "
+                "AND item_type='userMessage' ORDER BY rollout_ordinal DESC",
+                (event['thread-id'], event['turn-id']),
+            ):
+                content = json.loads(raw).get('content', [])
+                text = '\n'.join(part['text'] for part in content if part.get('type') == 'text')
+                if text.strip():
+                    return text
+    except (sqlite3.Error, json.JSONDecodeError):
+        # Missing history or an older schema must not prevent completion mail.
+        pass
+    return ''
+
+
+def enqueue(cfg, config, home, since, event, hold=False, sqlite=None):
     kind = event.get('type')
     if kind not in ('agent-turn-complete', 'model_capacity'):
         return None
@@ -240,7 +276,8 @@ def enqueue(cfg, config, home, since, event, hold=False):
     for value in (session, turn):
         if not isinstance(value, str) or not value or len(value) > 200 or any(ord(c) < 32 for c in value):
             raise ValueError('completion event requires valid thread-id and turn-id')
-    meta = metadata(home, session)
+    root = Path(sqlite) if sqlite is not None else sqlite_home(home)
+    meta = metadata(home, session, root)
     if meta['subagent'] is not False:
         return None
     scope = str(Path(config).resolve())
@@ -248,9 +285,11 @@ def enqueue(cfg, config, home, since, event, hold=False):
     key = hashlib.sha256((scope + '\0' + session + ('\0capacity' if capacity else '') + '\0' + turn).encode()).hexdigest()
     payload = {'session': session, 'turn': turn, 'name': meta['name'],
                'completed_at': time.time_ns() // 1_000_000, 'goal_completed': False,
-               'codex_home': str(Path(home).resolve())}
+               'codex_home': str(Path(home).resolve()), 'sqlite_home': str(root.resolve())}
     if capacity:
         payload['type'] = 'model_capacity'
+    elif prompt := completion_prompt(root, event):
+        payload['prompt'] = prompt
     with database(cfg) as conn:
         conn.execute('BEGIN IMMEDIATE')
         if conn.execute('SELECT 1 FROM jobs WHERE key=?', (key,)).fetchone():
@@ -268,7 +307,8 @@ def enqueue(cfg, config, home, since, event, hold=False):
 
 
 def mail_message(cfg, key, payload):
-    kind = '模型容量不足' if payload.get('type') == 'model_capacity' else ('Goal 已完成' if payload['goal_completed'] else '本轮已完成')
+    capacity = payload.get('type') == 'model_capacity'
+    kind = '模型容量不足' if capacity else ('Goal 已完成' if payload['goal_completed'] else '本轮已完成')
     if payload.get('recovery'):
         kind = {'submitted':'自动恢复请求已提交', 'exhausted':'容量不足，请检查',
                 'blocked':'模型容量不足：自动恢复受阻', 'skipped':'容量事件：无需恢复'}[payload['recovery']]
@@ -278,13 +318,14 @@ def mail_message(cfg, key, payload):
     when = datetime.datetime.fromtimestamp(payload['completed_at'] / 1000, datetime.timezone.utc)
     message['Date'] = email.utils.format_datetime(when)
     message['Message-ID'] = f'<{key}@codex24h.local>'
-    trigger = ('原生模型容量错误' if payload.get('type') == 'model_capacity' else 'Codex 原生完成事件')
-    time_label = '发生时间' if payload.get('type') == 'model_capacity' else '完成时间'
+    time_label = '发生时间' if capacity else '完成时间'
+    prompt = payload.get('prompt', '')
+    prefix = f'{prompt}\n\n' if prompt else ''
     detail = payload.get('recovery_detail', '')
-    message.set_content(f'{kind}\n{detail}\n\n会话：{payload["name"]}\nSession ID：{payload["session"]}\n'
+    footer = '\n此邮件由原生模型容量错误自动触发，未调用模型生成或发送。\n' if capacity else ''
+    message.set_content(f'{prefix}{kind}\n{detail}\n\n会话：{payload["name"]}\nSession ID：{payload["session"]}\n'
                         f'Turn ID：{payload["turn"]}\n{time_label}：{when.isoformat()}\n\n'
-                        f'恢复会话：\ncodex24h resume {shlex.quote(payload["session"])}\n\n'
-                        f'此邮件由{trigger}自动触发，未调用模型生成或发送。\n')
+                        f'恢复会话：\ncodex24h resume {shlex.quote(payload["session"])}\n{footer}')
     return message
 
 
@@ -326,7 +367,7 @@ def worker(config, key):
             payload = json.loads(row[0])
         for attempt in range(2):
             home = payload.get('codex_home', os.environ.get('CODEX_HOME', str(Path.home()/'.codex')))
-            if metadata(home, payload['session'])['subagent'] is not False:
+            if metadata(home, payload['session'], payload.get('sqlite_home'))['subagent'] is not False:
                 with database(cfg) as conn:
                     conn.execute("UPDATE jobs SET state='suppressed',error='Main session ownership could not be confirmed' WHERE key=?", (key,))
                     conn.commit()
@@ -376,15 +417,17 @@ def notify(args):
             print(f'codex24h-mail: previous notify failed: {type(error).__name__}', file=sys.stderr)
     cfg = load_config(args.config)
     if cfg:
-        key = enqueue(cfg, args.config, args.codex_home, args.since, json.loads(args.event))
+        key = enqueue(cfg, args.config, args.codex_home, args.since, json.loads(args.event),
+                      sqlite=getattr(args, 'sqlite_home', None))
         if key:
             spawn_worker(args.config, key)
 
 
 class CompletionWatch:
     """Match only this TUI's user-message IDs; never guess the newest thread."""
-    def __init__(self, home, session=None):
+    def __init__(self, home, session=None, sqlite=None):
         self.home = Path(home)
+        self.sqlite_home = Path(sqlite) if sqlite is not None else sqlite_home(home)
         self.since = time.time_ns() // 1_000_000
         self.sessions = set()
         self.messages = set()
@@ -393,7 +436,7 @@ class CompletionWatch:
             try:
                 self.sessions.add(str(uuid.UUID(session)))
             except ValueError:
-                for path in self.home.glob('state_*.sqlite'):
+                for path in self.sqlite_home.glob('state_*.sqlite'):
                     with contextlib.closing(sqlite3.connect(path.resolve().as_uri()+'?mode=ro', uri=True)) as conn:
                         self.sessions.update(row[0] for row in conn.execute(
                             'SELECT id FROM threads WHERE name=?', (session,)))
@@ -409,9 +452,9 @@ class CompletionWatch:
         if record.get('dir') == 'codex24h' and record.get('kind') == 'resume':
             lookup = runpy.run_path(str(Path(__file__).with_name('codex24h-requests')))
             try:
-                session = lookup['resolve_session'](self.home, record['session'])
+                session = lookup['resolve_session'](self.sqlite_home, record['session'])
                 if session not in self.sessions:
-                    path = self.home/'thread_history_1.sqlite'
+                    path = self.sqlite_home/'thread_history_1.sqlite'
                     if path.exists():
                         with contextlib.closing(sqlite3.connect(path.resolve().as_uri()+'?mode=ro', uri=True, timeout=.5)) as conn:
                             self.seen.update((session, row[0]) for row in conn.execute(
@@ -431,7 +474,7 @@ class CompletionWatch:
 
     def completed(self, initial=False):
         """Return this frontend's completed turns and structured capacity failures."""
-        path = self.home/'thread_history_1.sqlite'
+        path = self.sqlite_home/'thread_history_1.sqlite'
         if not path.exists():
             return []
         found = []
@@ -471,7 +514,8 @@ class CompletionWatch:
 def watch(args):
     cfg = load_config(args.config)
     password(cfg)
-    observer = CompletionWatch(args.codex_home, args.session)
+    observer = CompletionWatch(args.codex_home, args.session,
+                               sqlite_home(args.codex_home, json.loads(args.launch_args)))
     # The recording is a pipe, never a chat log on disk. SMTP stays in workers.
     with tempfile.TemporaryDirectory(prefix='codex24h-mail-') as directory:
         path = Path(directory)/'events'
@@ -517,7 +561,8 @@ def watch(args):
                             recovery.reset(event['thread-id'])
                         if args.standalone:
                             continue
-                        key = enqueue(cfg, args.config, args.codex_home, observer.since, event)
+                        key = enqueue(cfg, args.config, args.codex_home, observer.since, event,
+                                      sqlite=observer.sqlite_home)
                         if key:
                             spawn_worker(args.config, key)
                 recovery.tick()
@@ -557,10 +602,12 @@ def main():
         if name == 'prepare':
             sub.add_argument('args', nargs=argparse.REMAINDER)
         if name == 'notify':
+            sub.add_argument('--sqlite-home', type=Path)
             sub.add_argument('--since', type=int, required=True)
             sub.add_argument('--previous', default='[]')
             sub.add_argument('event')
         if name == 'watch':
+            sub.add_argument('--launch-args', default='[]')
             sub.add_argument('--session')
             sub.add_argument('--standalone', action='store_true')
         if name == 'worker':

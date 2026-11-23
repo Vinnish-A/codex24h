@@ -58,7 +58,8 @@ def run(binary, codex, session, smtp, config, socket, standalone=False):
         wait(lambda text: '› /model' in text, 'native Tab')
         tmux('send-keys', '-t', pane, 'C-u')
         if smtp:
-            tmux('send-keys', '-t', pane, '-l', '只回复 COMPAT_MAIL_OK，不要调用工具。')
+            prompt = '只回复 COMPAT_MAIL_OK，不要调用工具。'
+            tmux('send-keys', '-t', pane, '-l', prompt)
             time.sleep(.3)
             tmux('send-keys', '-t', pane, 'Enter')
             raw = smtp.messages.get(timeout=90)
@@ -67,7 +68,9 @@ def run(binary, codex, session, smtp, config, socket, standalone=False):
             assert 'Session ID：' in message.get_content()
             if session:
                 assert session in message.get_content()
-            body = '\n'.join(line for line in message.get_content().splitlines() if not line.startswith('会话：'))
+            lines = message.get_content().splitlines()
+            assert lines[:3] == [prompt, '', '本轮已完成']
+            body = '\n'.join(line for line in lines[3:] if not line.startswith('会话：'))
             assert 'COMPAT_MAIL_OK' not in body
         print(json.dumps({'version': version, 'resume': bool(session), 'agents': not standalone,
                           'completion': True, 'mail': bool(smtp)}, ensure_ascii=False), flush=True)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in real Codex capacity recovery against local SSE + TLS SMTP only.
 
-Run CODEX24H_CODEX=/path/to/codex python3 tests/native_capacity.py [--standalone].
+Run CODEX24H_CODEX=/path/to/codex python3 tests/native_capacity.py [--standalone] [--relocated-sqlite].
 Uses an isolated CODEX_HOME and daemon; never contacts a real model or SMTP host.
 """
 from email import policy
@@ -45,6 +45,8 @@ def main():
     e2e.BIN = Path(os.environ.get('CODEX24H_TEST_BIN',ROOT/'target/debug/codex24h'))
     with tempfile.TemporaryDirectory(prefix='codex24h-native-capacity-') as directory:
         base=Path(directory);home=base/'codex';home.mkdir()
+        sqlite_home = base/'sqlite' if '--relocated-sqlite' in sys.argv else home
+        sqlite_home.mkdir(exist_ok=True)
         cert,key=base/'cert.pem',base/'key.pem'
         subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1',
                         '-keyout',str(key),'-out',str(cert),'-subj','/CN=localhost',
@@ -61,6 +63,7 @@ def main():
             (home/'config.toml').write_text(f'''
 model = "local-capacity-model"
 model_provider = "mock"
+sqlite_home = {json.dumps(str(sqlite_home))}
 [features]
 goals = true
 api_key_model_discovery = false
@@ -119,7 +122,7 @@ supports_websockets = false
                 received=mails(4)
                 assert all('自动恢复请求已提交' in str(m['Subject']) for m in received[:3])
                 assert '容量不足，请检查' in str(received[3]['Subject'])
-                with sqlite3.connect(home/'thread_history_1.sqlite') as conn:
+                with sqlite3.connect(sqlite_home/'thread_history_1.sqlite') as conn:
                     turns=conn.execute('SELECT turn_id,status FROM thread_turns ORDER BY rowid').fetchall()
                     inputs=[json.loads(row[0]) for row in conn.execute("SELECT item_json FROM thread_items WHERE item_type='userMessage' ORDER BY rowid")]
                 assert len(turns)==4 and all(status=='failed' for _,status in turns),repr(turns)
@@ -135,20 +138,20 @@ supports_websockets = false
                 notice=mails(1)[0]
                 assert '自动恢复受阻' in str(notice['Subject'])
                 assert '不是 paused' in notice.get_content()
-                with sqlite3.connect(home/'goals_1.sqlite') as conn:
+                with sqlite3.connect(sqlite_home/'goals_1.sqlite') as conn:
                     session,status=conn.execute('SELECT thread_id,status FROM thread_goals').fetchone()
                 assert status=='blocked'
                 submit('/goal pause')
 
                 def paused():
-                    with sqlite3.connect(home/'goals_1.sqlite') as conn:
+                    with sqlite3.connect(sqlite_home/'goals_1.sqlite') as conn:
                         row=conn.execute('SELECT status FROM thread_goals WHERE thread_id=?',(session,)).fetchone()
                     return row and row[0]=='paused'
                 wait_for(paused,10)
                 terminal.drain(2)
                 # Persist a fresh, isolated capacity failure while the actual TUI
                 # holds a paused Goal. The next turn is driven by native /goal resume.
-                with sqlite3.connect(home/'thread_history_1.sqlite') as conn:
+                with sqlite3.connect(sqlite_home/'thread_history_1.sqlite') as conn:
                     ordinal=conn.execute('SELECT max(rollout_ordinal) FROM thread_turns WHERE thread_id=?',(session,)).fetchone()[0]+10
                     conn.execute('''INSERT INTO thread_turns(thread_id,turn_id,rollout_ordinal,status,error_json,started_at,completed_at)
                                     VALUES (?,?,?,'failed',?,?,?)''',
@@ -158,7 +161,7 @@ supports_websockets = false
                 assert '自动恢复请求已提交' in str(found[0]['Subject']),found[0].get_content()
                 assert '/goal resume' in found[0].get_content()
                 assert '第 1/3 次' in found[0].get_content(),'manual new Goal must reset the budget'
-                with sqlite3.connect(home/'thread_history_1.sqlite') as conn:
+                with sqlite3.connect(sqlite_home/'thread_history_1.sqlite') as conn:
                     count=conn.execute('SELECT count(*) FROM thread_turns').fetchone()[0]
                 assert count==7,'four ordinary turns, Goal creation, synthetic failure and one native resume: '+str(count)
                 print('PASS real Codex: fresh Goal identity, blocked guard, native paused Goal resume and confirmed mail',flush=True)

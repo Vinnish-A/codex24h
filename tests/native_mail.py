@@ -34,8 +34,8 @@ def main():
                 config.write_text('\n'.join(f'{k} = {json.dumps(v)}' for k,v in cfg.items()))
                 binary = os.environ.get('CODEX24H_TEST_BIN',str(ROOT/'target/debug/codex24h'))
                 env = os.environ | {'CODEX24H_MAIL_CONFIG':str(config)}
-                result = subprocess.run([binary,'exec','--skip-git-repo-check','--json',
-                                         '仅回复 MAIL_NOTIFY_OK，不要调用工具，不要读写文件。'],
+                prompt = '仅回复 MAIL_NOTIFY_OK，不要调用工具，不要读写文件。'
+                result = subprocess.run([binary,'exec','--skip-git-repo-check','--json', prompt],
                                         cwd=ROOT,env=env,capture_output=True,text=True,timeout=120)
                 if result.returncode:
                     raise RuntimeError(f'native Codex exited {result.returncode}; stderr retained only in memory')
@@ -49,7 +49,9 @@ def main():
                 message = BytesParser(policy=policy.default).parsebytes(raw)
                 assert session in message.get_content(), 'email did not identify the actual native session'
                 assert '本轮已完成' in str(message['Subject']), 'ordinary turn mislabeled'
-                without_name = '\n'.join(line for line in message.get_content().splitlines() if not line.startswith('会话：'))
+                lines = message.get_content().splitlines()
+                assert lines[:3] == [prompt, '', '本轮已完成'], 'email did not begin with the original prompt'
+                without_name = '\n'.join(line for line in lines[3:] if not line.startswith('会话：'))
                 assert 'MAIL_NOTIFY_OK' not in without_name, 'assistant body leaked into notification'
                 print('PASS: native exec completion automatically delivered TLS mail with actual session ID and session name', flush=True)
                 print(f'Test session: {session}')
@@ -60,7 +62,8 @@ def main():
                     terminal.until('Ask Codex', timeout=45)
                     terminal.until('MAIL_NOTIFY_OK', timeout=45)
                     terminal.drain(1)
-                    terminal.send('仅回复 SECOND_MAIL_OK，不要调用工具，不要读写文件。'.encode())
+                    second_prompt = '仅回复 SECOND_MAIL_OK，不要调用工具，不要读写文件。'
+                    terminal.send(second_prompt.encode())
                     terminal.drain(.4)
                     terminal.send(b'\r')
                     deadline = time.monotonic()+90
@@ -77,6 +80,7 @@ def main():
                         raise AssertionError('resumed native TUI did not produce a completion email')
                     second = BytesParser(policy=policy.default).parsebytes(raw)
                     assert session in second.get_content()
+                    assert second.get_content().splitlines()[:3] == [second_prompt, '', '本轮已完成']
                     assert second['Message-ID'] != message['Message-ID']
                     print('PASS: resumed native TUI turn automatically delivered a second email', flush=True)
                 finally:

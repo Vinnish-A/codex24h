@@ -1,6 +1,6 @@
 # 邮件通知
 
-启用后，每轮回答结束会自动发送一封邮件，附上会话名、Session ID、完成时间和恢复命令。若这一轮完成了 Goal，标题和正文会标注 **Goal 已完成**。发信由本机程序执行，不需要 agent 调用工具或生成邮件。
+启用后，每轮回答结束会自动发送一封邮件。正文先显示该轮最后一条用户请求的原文，再显示 **本轮已完成**、会话名、Session ID、完成时间和恢复命令。若这一轮完成了 Goal，标题和正文会标注 **Goal 已完成**。
 
 邮件标题示例：
 
@@ -132,7 +132,9 @@ CODEX24H_MAIL=0 codex24h resume --last
 
 使用 Codex 原生的 [`notify` / `agent-turn-complete` 事件](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications)。Wrapper 仅为本次启动附加通知配置，不修改 Codex 全局配置；原有通知命令仍会执行。共享模式通过作用域内的轮次元数据观察完成和容量事件；没有用模型判断是否发信。
 
-会话名称、来源、父子关系和 Goal 状态从本机 Codex 元数据只读获取；版本验证范围见 [README](../README.md#codex-版本兼容)。名称优先使用手动命名，其次使用 Codex 保存的标题；名称为空时以 Session ID 标识。邮件不附带对话正文。子 agent 的独立完成事件和容量错误不发送邮件。
+会话名称、来源、父子关系和 Goal 状态从本机 Codex 元数据只读获取；版本验证范围见 [README](../README.md#codex-版本兼容)。名称优先使用手动命名，其次使用 Codex 保存的标题；名称为空时以 Session ID 标识。完成通知从原生事件或该轮的结构化历史获取用户请求文本，并随邮件记录保存在本机队列中以便重试。没有可用的请求文本时，正文从完成状态开始。子 agent 的独立完成事件和容量错误不发送邮件。
+
+数据库目录支持 Codex 用户配置中的 `sqlite_home`、profile 和命令行覆盖，也支持 `CODEX_SQLITE_HOME` 环境变量；配置值优先于环境变量，均未设置时使用 `CODEX_HOME`。将数据库移到本地磁盘后无需迁回旧目录。更新 codex24h 后需重新打开或恢复前端，已运行的监控进程不会自动加载修复。
 
 Goal 必须在本次接入通知之后变为 `complete` 才会标注，且每个 Goal 只标注一次；恢复一个早已完成的 Goal 不会误报为新完成。它代表 Codex 的 Goal 状态，不额外判断任务的实际质量。
 
@@ -148,6 +150,7 @@ python3 tests/recovery.py
 # 可选：真实 Codex + 隔离后台 + 本地模拟 SSE 容量错误及 TLS SMTP，无外部模型请求。
 CODEX24H_CODEX=/path/to/codex python3 tests/native_capacity.py
 CODEX24H_CODEX=/path/to/codex python3 tests/native_capacity.py --standalone
+CODEX24H_CODEX=/path/to/codex python3 tests/native_capacity.py --relocated-sqlite
 
 # 可选：发送两次真实模型请求，验证 exec 和 resume TUI 自动通知。
 # 邮件只投递给本机测试 TLS SMTP 服务，不发到外部邮箱。

@@ -196,6 +196,13 @@ pub fn arguments(
                 .arg(&config)
                 .arg("--codex-home")
                 .arg(&home)
+                .arg("--launch-args")
+                .arg(serde_json::to_string(
+                    &args
+                        .iter()
+                        .map(|arg| arg.to_string_lossy())
+                        .collect::<Vec<_>>(),
+                )?)
                 .stdout(Stdio::piped());
             if !shared {
                 command.arg("--standalone");

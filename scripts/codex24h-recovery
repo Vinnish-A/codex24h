@@ -36,6 +36,7 @@ class Recovery:
     def __init__(self, mail, cfg, args, directory, observer):
         self.mail, self.cfg, self.args = mail, cfg, args
         self.directory, self.observer = Path(directory), observer
+        self.sqlite_home = getattr(observer, 'sqlite_home', None) or mail['sqlite_home'](args.codex_home)
         self.scope = str(args.config.resolve())
         self.active = None
         self.proof = None
@@ -128,7 +129,7 @@ class Recovery:
                                   'automatic':own['key'] if own else None}
 
     def resolve_messages(self):
-        path = Path(self.args.codex_home)/'thread_history_1.sqlite'
+        path = self.sqlite_home/'thread_history_1.sqlite'
         if not path.exists() or not self.messages:
             return
         with contextlib.closing(sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True,timeout=.5)) as conn:
@@ -166,7 +167,8 @@ class Recovery:
     def capacity(self, event):
         # enqueue's existing main-session validation and unique key are shared by
         # manual delivery and recovery. Hold the job until submission is confirmed.
-        key = self.mail['enqueue'](self.cfg,self.args.config,self.args.codex_home,self.observer.since,event,hold=self.owner)
+        key = self.mail['enqueue'](self.cfg,self.args.config,self.args.codex_home,self.observer.since,event,
+                                   hold=self.owner,sqlite=self.sqlite_home)
         if not key:
             return
         with self.mail['database'](self.cfg) as conn:
@@ -183,7 +185,7 @@ class Recovery:
                'due':time.monotonic()+random.SystemRandom().uniform(3,10),
                'generation':self.proof if session == self.active else None}
         try:
-            job['goal'] = goal_state(self.args.codex_home,session)
+            job['goal'] = goal_state(self.sqlite_home,session)
         except sqlite3.Error:
             job['goal_unknown'] = True
         self.pending[key] = job
@@ -205,7 +207,7 @@ class Recovery:
         self.capacity({'type':'model_capacity','thread-id':session,'turn-id':turn})
 
     def latest(self, session):
-        path = Path(self.args.codex_home)/'thread_history_1.sqlite'
+        path = self.sqlite_home/'thread_history_1.sqlite'
         with contextlib.closing(sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True,timeout=.5)) as conn:
             return conn.execute('SELECT turn_id,status FROM thread_turns WHERE thread_id=? ORDER BY rowid DESC LIMIT 1',(session,)).fetchone()
 
@@ -241,7 +243,7 @@ class Recovery:
                     job['written'] = True
                 try:
                     if job['command'] == '/goal resume' and job.get('written'):
-                        goal = goal_state(self.args.codex_home,job['session'])
+                        goal = goal_state(self.sqlite_home,job['session'])
                         latest = self.latest(job['session'])
                         # Goal may already have paused again after another capacity
                         # error. A new turn also proves native resume acceptance.
@@ -257,7 +259,7 @@ class Recovery:
             if time.monotonic() < job['due']:
                 continue
             try:
-                goal = goal_state(self.args.codex_home,job['session'])
+                goal = goal_state(self.sqlite_home,job['session'])
                 latest = self.latest(job['session'])
             except sqlite3.Error:
                 self.finish(job,'blocked','无法读取可靠的任务/Goal 状态，未自动发送，请检查容量。')

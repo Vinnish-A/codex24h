@@ -78,6 +78,29 @@ class RecoveryTests(unittest.TestCase):
             self.goal('active')
         self.controller.tick()
 
+    def test_relocated_sqlite_capacity_and_paused_goal_resume(self):
+        root = self.case.base/'sqlite'; root.mkdir()
+        self.goal('paused')
+        with sqlite3.connect(self.home/'thread_history_1.sqlite') as conn:
+            conn.execute('INSERT INTO thread_turns VALUES (?,?,?,0)', ('session-1','relocated-failure','failed'))
+        for path in self.home.glob('*.sqlite'):
+            path.rename(root/path.name)
+        (self.home/'config.toml').write_text(f'sqlite_home = {json.dumps(str(root))}\n')
+        self.controller = self.new_controller()
+        self.controller.active, self.controller.proof = 'session-1', 0
+        self.controller.capacity({'type':'model_capacity','thread-id':'session-1','turn-id':'relocated-failure'})
+        job = next(iter(self.controller.pending.values()))
+        self.advance()
+        self.assertEqual(job['command'], '/goal resume')
+        module['atomic_json'](self.directory/'recovery-ack.json', dict(key=job['key'],status='written'))
+        with sqlite3.connect(root/'goals_1.sqlite') as conn:
+            conn.execute("UPDATE thread_goals SET status='active'")
+        self.controller.tick()
+        payload, state = self.payload(job['key'])
+        self.assertEqual(state, 'pending')
+        self.assertEqual(payload['recovery'], 'submitted')
+        self.assertEqual(payload['sqlite_home'], str(root))
+
     def test_three_submissions_then_capacity_check_and_manual_reset(self):
         for n in range(1,4):
             job,event=self.fail('failure-'+str(n));self.advance()
